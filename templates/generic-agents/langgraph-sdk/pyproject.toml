@@ -1,0 +1,45 @@
+[project]
+name = "generic-agent-langgraph"
+version = "0.1.0"
+description = "Generic tool-using agent on LangGraph / LangChain v1 create_agent, for Bedrock + AgentCore Runtime."
+requires-python = ">=3.12"
+dependencies = [
+  "langgraph>=1.0,<2",
+  "langchain>=1.0,<2",
+  "langchain-aws>=1.0,<2",
+  "bedrock-agentcore>=1.23,<2",
+  "org-agents",
+  "generic-tools",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+org-agents = { path = "../../shared/python", editable = true }
+generic-tools = { path = "../tools", editable = true }
+
+[tool.uv]
+exclude-newer = "2026-09-20T00:00:00Z"   # 7-day cooldown (CODING_STANDARDS.md §7)
+
+[dependency-groups]
+dev = ["mypy>=1.18", "pytest>=8", "ruff>=0.13"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

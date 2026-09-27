@@ -91,6 +91,70 @@
         "idleRuntimeSessionTimeout": 900,
         "maxLifetime": 3600
       }
+    },
+    {
+      "name": "generic_langgraph_sdk",
+      "build": "Container",
+      "entrypoint": "src/generic_agent_langgraph/shell/app.py",
+      "codeLocation": "generic-agents/langgraph-sdk/",
+      "buildContextPath": ".",
+      "dockerfile": "generic-agents/langgraph-sdk/Dockerfile",
+      "runtimeVersion": "PYTHON_3_12",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "envVars": [
+        {
+          "name": "AWS_REGION",
+          "value": "eu-west-1"
+        },
+        {
+          "name": "AGENT_MAX_USD",
+          "value": "0.50"
+        },
+        {
+          "name": "AGENT_MAX_TURNS",
+          "value": "12"
+        }
+      ],
+      "requestHeaderAllowlist": [
+        "Authorization"
+      ],
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 3600
+      }
+    },
+    {
+      "name": "generic_pydantic_sdk",
+      "build": "Container",
+      "entrypoint": "src/generic_agent_pydantic/shell/app.py",
+      "codeLocation": "generic-agents/pydantic-sdk/",
+      "buildContextPath": ".",
+      "dockerfile": "generic-agents/pydantic-sdk/Dockerfile",
+      "runtimeVersion": "PYTHON_3_12",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "envVars": [
+        {
+          "name": "AWS_REGION",
+          "value": "eu-west-1"
+        },
+        {
+          "name": "AGENT_MAX_USD",
+          "value": "0.50"
+        },
+        {
+          "name": "AGENT_MAX_TURNS",
+          "value": "12"
+        }
+      ],
+      "requestHeaderAllowlist": [
+        "Authorization"
+      ],
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 3600
+      }
     }
   ],
   "memories": [],
