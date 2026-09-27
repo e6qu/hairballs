@@ -45,11 +45,22 @@ Start with [the developer introduction](../../AGENTCORE_BEDROCK_LANDSCAPE.md) if
 
 Infrastructure: `@aws/agentcore` CLI 0.30.0, and Terraform with the `hashicorp/aws` provider ~> 6.66.
 
-**How the examples were checked:** no example was run against AWS.
-- Python examples pass an import check and `ruff`.
-- TypeScript examples pass `tsc --noEmit` in strict mode.
-- Terraform passes `terraform validate`.
-- AWS CLI commands were checked against the botocore 1.43.103 API models.
+**How the examples are checked:** no example is run against AWS. [`check.sh`](check.sh) runs:
+
+| What | Checks |
+|---|---|
+| Python | `ruff format --check`, `ruff check`, `mypy --strict` |
+| TypeScript | `tsc --noEmit` (strict), `prettier --check` |
+| Terraform | `terraform fmt -check`, `terraform validate` |
+| `cli.sh` | `shellcheck` |
+| Tutorials | `markdownlint`, plus a test that every code line shown in a tutorial exists in its checked example files |
+
+AWS CLI commands were also checked against the botocore 1.43.103 API models.
+
+```bash
+tutorials/agentcore/check.sh              # all tutorials
+tutorials/agentcore/check.sh 01-first-agent
+```
 
 Anything that needs a real account to confirm is marked **[verify]**.
 

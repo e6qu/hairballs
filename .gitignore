@@ -13,3 +13,6 @@ __pycache__/
 results.tsv
 run.log
 holdout-*.log
+.terraform/
+.terraform.lock.hcl
+*.tfstate*
