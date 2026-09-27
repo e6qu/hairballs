@@ -28,7 +28,7 @@ from langchain.agents.middleware.types import ToolCallRequest, hook_config
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command
-from org_agents.core.guard import StopRun
+from org_agents.core.guard import StopReason, StopRun
 from org_agents.domain import TokenCount, ToolName, Usage
 from org_agents.parsing import ParseError, expect_int, expect_mapping
 from org_agents.shell.run_guard import BlockTool, Proceed, RequireApproval, RunGuard
@@ -56,6 +56,9 @@ def parse_usage_metadata(raw: object) -> Usage:
     )
 
 
+CANCEL_DETAIL = "cancelled by request"
+
+
 class RunControl:
     """Mutable per-thread run state shared by the middleware and the runner."""
 
@@ -68,7 +71,6 @@ class RunControl:
     def begin(self, guard: RunGuard) -> None:
         with self._lock:
             self._guard = guard
-            self._cancelled = False
 
     @property
     def guard(self) -> RunGuard:
@@ -87,16 +89,26 @@ class RunControl:
         return pending
 
     def cancel(self) -> None:
+        """Called by the runner only while a run is in progress; cleared by :meth:`end`."""
         with self._lock:
             self._cancelled = True
 
+    def end(self) -> bool:
+        """Called by the runner when a run finishes; returns whether a cancel was requested."""
+        with self._lock:
+            cancelled, self._cancelled = self._cancelled, False
+            return cancelled
+
     @property
     def cancelled(self) -> bool:
+        """Whether a cancel was requested; if so it is recorded on the guard (``cancelled`` stop)."""
+        if self._cancelled:
+            self.guard.record_external_stop(StopReason.CANCELLED, CANCEL_DETAIL)
         return self._cancelled
 
     @property
     def must_stop(self) -> bool:
-        return self._cancelled or self.guard.stopped is not None
+        return self.cancelled or self.guard.stopped is not None
 
 
 def _error(request: ToolCallRequest, text: str) -> ToolMessage:

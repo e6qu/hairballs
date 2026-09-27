@@ -5,8 +5,9 @@ non-coding assistant, so everything that reaches the host (shell, files, web, sa
 delegation, file-backed memory/sessions/skills, date-stamped environment context) is switched off.
 What stays on is what helps a long-running tool-using assistant:
 
-* the SDK context manager (``"auto"``): large tool results are truncated into an in-memory stash
-  and the conversation is summarized near the context-window limit;
+* the SDK context manager (the ``"auto"`` strategies, built in ``context.py`` so the summarizer's
+  model calls are metered by the guard and compactions are audited): large tool results are
+  truncated into an in-memory stash and the conversation is summarized near the context-window limit;
 * the harness ``ContextOffloader``: oversized tool results go to a per-process temp directory,
   with a preview and a reference left in context (``retrieve_offloaded_content``);
 * the harness behavioural contract, prepended to the org system prompt (both are static, so the
@@ -21,6 +22,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 from strands import Agent
+from strands.experimental.context_manager import ContextManager
 from strands.hooks import HookProvider
 from strands.models import Model
 from strands.types.tools import AgentTool
@@ -36,6 +38,7 @@ def build_agent(
     tools: Sequence[AgentTool],
     instructions: str,
     hooks: Sequence[HookProvider],
+    context_manager: ContextManager,
 ) -> Agent:
     return create_harness(
         model=model,
@@ -45,7 +48,7 @@ def build_agent(
         builtin_plugins=[],  # no todos; no "environment" (it injects the date and cwd every turn)
         background_tasks=False,  # tools run inline, so every call passes the guard hooks in order
         caching=False,  # configured on the model instance instead (see module docstring)
-        context_manager="auto",
+        context_manager=context_manager,  # the "auto" strategies, metered and audited
         session=False,  # in-memory conversation; offloaded results go to a temp dir
         skills=False,
         memory=False,  # file-backed long-term memory with its own model calls: off

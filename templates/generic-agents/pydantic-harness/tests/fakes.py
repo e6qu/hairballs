@@ -33,6 +33,7 @@ class Turn:
     input_tokens: int = 100
     output_tokens: int = 20
     before: Callable[[], None] | None = None  # runs inside the model call (e.g. a mid-run message)
+    error: Exception | None = None  # raised instead of responding (a provider/framework failure)
 
 
 @dataclass
@@ -52,6 +53,8 @@ class ScriptedModel:
         self.calls += 1
         if turn.before is not None:
             turn.before()
+        if turn.error is not None:
+            raise turn.error
         parts: list[ModelResponsePart] = [TextPart(turn.text)] if turn.text else []
         parts += [
             ToolCallPart(c.name, c.args, tool_call_id=f"call-{index}-{i}")

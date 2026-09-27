@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterator, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -22,6 +22,7 @@ class Turn:
     tool_calls: tuple[ToolCall, ...] = ()
     input_tokens: int = 100
     output_tokens: int = 20
+    error: Exception | None = None  # raised instead of streaming (a provider/framework failure)
 
 
 @dataclass
@@ -29,6 +30,7 @@ class ScriptedModel(Model):
     turns: Sequence[Turn]
     calls: int = 0
     seen_messages: list[list[dict[str, Any]]] = field(default_factory=list)
+    on_call: Callable[[int], object] | None = None  # runs before call N streams (e.g. to cancel mid-run)
 
     def update_config(self, **model_config: Any) -> None:
         pass
@@ -45,6 +47,10 @@ class ScriptedModel(Model):
         exhausted = self.calls >= len(self.turns)
         turn = Turn(text="(script exhausted)") if exhausted else self.turns[self.calls]
         self.calls += 1
+        if self.on_call is not None:
+            self.on_call(self.calls - 1)
+        if turn.error is not None:
+            raise turn.error
         for event in _events(turn):
             yield event
 

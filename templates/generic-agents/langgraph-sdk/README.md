@@ -15,11 +15,12 @@ A generic, tool-using internal assistant on **LangGraph** using the **LangChain 
 | Concern | How |
 |---|---|
 | Limits | Turns, total tokens, **USD budget**, wall clock, tool calls, loop detection (identical call ×3), kill switch. These are enforced by the `org_agents` `RunGuard` through `GuardMiddleware` (`shell/middleware.py`): `before_model` (a stop appends a final `AIMessage` and jumps to `end`), `after_model` (usage), `wrap_tool_call` (policy, loops, approval) |
-| Recursion limit | LangGraph's default `recursion_limit` is **10 007** supersteps (`langgraph/_internal/_config.py`). Every run sets an explicit limit, `4 × (max_turns + 1) + 1`, which is 53 for the default 12 turns (`core/recursion.py`). A turn is at most 4 supersteps: `GuardMiddleware.before_model` → `model` → `GuardMiddleware.after_model` → `tools`. The guard always stops first; the limit is a **second line of defence**. `GraphRecursionError` becomes `stopped` / `turn_limit` |
+| Recursion limit | LangGraph's default `recursion_limit` is **10 007** supersteps (`langgraph/_internal/_config.py`). Every run sets an explicit limit, `4 × (max_turns + 1) + 1`, which is 53 for the default 12 turns (`core/recursion.py`). A turn is at most 4 supersteps: `GuardMiddleware.before_model` → `model` → `GuardMiddleware.after_model` → `tools`. The guard always stops first; the limit is a **second line of defence**. `GraphRecursionError` becomes `stopped` / `turn_limit` (recorded with `RunGuard.record_external_stop`, so it is audited). `turn_limit` is kept rather than `framework_limit` because the limit is derived from `max_turns` |
 | Tool policy | Allowlist and approval-required globs in `config/agent.toml`. Unlisted tools (including tools the graph does not know about) are blocked in `wrap_tool_call` with an error `ToolMessage` |
 | Approval | `wrap_tool_call` calls LangGraph **`interrupt()`**. The `InMemorySaver` checkpointer stores the paused thread (`thread_id` = AgentCore session id). The **interrupt id is the approval id**. The reply is `approval_required` with the approvers. An approver sends `{"approval": {"id", "decision"}}`, which becomes `Command(resume={interrupt_id: decision})`. The tool task re-runs, and `interrupt()` returns the decision. Four-eyes is enforced by the org thread core: the requester cannot self-approve unless `self_approval = true` |
 | Usage | `AIMessage.usage_metadata` is parsed into org `Usage` (`core/usage.py`). LangChain's `input_tokens` **includes** cache reads and writes (`langchain_aws` `_extract_usage_metadata`), so `input_token_details.cache_read` / `cache_creation` / `ephemeral_*` are subtracted to avoid double billing |
-| Messages mid-run | Pure thread state machine (`org_agents.core.thread`): the run owner **steers**, other users are **queued** as follow-ups, duplicates are ignored, and cancel stops the agent. See "Steering" below |
+| Messages mid-run | Pure thread state machine (`org_agents.core.thread`): the run owner **steers**, other users are **queued** as follow-ups, duplicates are ignored. See "Steering" and "Cancellation" below |
+| Failures | An exception from the model or the graph (throttling, validation, a crashing tool…) ends the run with `{"status": "failed", "error": ...}` naming only the error class; the redacted message goes to the `run_failed` audit event. Tool calls left unanswered in the checkpoint get error `ToolMessage`s (`update_state(..., as_node="tools")`), the thread is idle and queued follow-ups still run |
 | Caching | `BedrockPromptCachingMiddleware` (langchain-aws) adds Converse `cachePoint`s. The system prompt is stable, the tool list is fixed, and history is append-only |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
 | Identity | The caller's Auth0 JWT (validated by the AgentCore Runtime `customJWTAuthorizer`) is forwarded in `Authorization`, and `sub` becomes the principal. The principal and session reach tools through a typed LangGraph run context (`RunContext`, injected as `ToolRuntime`), never from the model |
@@ -35,9 +36,12 @@ A message that arrives while a model call is already in flight is injected befor
 
 ### Cancellation
 
-A cancel sets a flag in `GuardMiddleware`:
-- the next `before_model` ends the run with `Run cancelled by the user.`;
-- pending tool calls get an error result.
+A cancel during a run sets a flag in `GuardMiddleware` (cleared when the run finishes):
+- the next `before_model` records `StopReason.CANCELLED` on the guard and ends the run; the reply is `stopped` / `cancelled` with the text `Run cancelled by the user.`;
+- pending tool calls get an error result;
+- a cancel that lands during the final model call still turns the reply into `stopped` / `cancelled` (with the model's answer as text).
+
+A cancel while awaiting approval returns the thread to idle; the interrupted tool calls are answered with error `ToolMessage`s so the next prompt starts from a valid history.
 
 History therefore stays valid, with every `tool_use` paired with a `tool_result`. LangGraph's `RunControl.request_drain()` was not used: it stops at a superstep boundary, which can leave unanswered tool calls in the checkpoint.
 
@@ -77,7 +81,7 @@ curl -s localhost:8080/invocations -H 'Content-Type: application/json' \
 
 The request payloads and replies are identical to the reference variant:
 - payloads: `{"prompt", "message_id"?}`, `{"cancel": true}`, `{"approval": {"id", "decision"}}`;
-- replies: `completed`, `approval_required`, `stopped`, `steered`, `queued`, `cancelling`, `duplicate`, `refused`, `invalid_request`.
+- replies: `completed`, `approval_required`, `stopped`, `failed`, `steered`, `queued`, `cancelling`, `duplicate`, `refused`, `invalid_request`.
 
 ## Deploy (current AgentCore)
 
@@ -107,5 +111,5 @@ docker build -f generic-agents/langgraph-sdk/Dockerfile -t generic-langgraph-sdk
 - **Approval resume re-executes the tool task.** LangGraph restarts the interrupted node from the top. `wrap_tool_call` therefore runs again (on the fresh guard of the resumed run) and `interrupt()` returns the decision. Parallel tool calls are separate `Send` tasks, so the other calls in the same step are not re-run. Side-effecting tools must be idempotent anyway, and `create_ticket` is.
 - **No history window.** Strands' `SlidingWindowConversationManager(40)` has no drop-in equivalent here. The thread history grows until the session ends, bounded per run by the guard's token and USD limits. Add `SummarizationMiddleware` if longer threads are needed.
 - **Steering** is implemented by the variant, not the framework (see above).
-- If the recursion limit ever fires (the guard was bypassed), the checkpoint can end mid-loop. The next prompt in that session may then fail on unanswered tool calls, and the session should be restarted.
+- If the recursion limit ever fires (the guard was bypassed), the checkpoint can end mid-loop. Unanswered tool calls of the last AI message are then answered with error `ToolMessage`s, as for failed runs, so the next prompt can proceed.
 - `bedrock-agentcore` emits a Pydantic deprecation warning on import (upstream).

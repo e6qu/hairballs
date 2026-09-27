@@ -24,12 +24,17 @@ def server() -> Iterator[str]:
     env = {**os.environ, "MCP_PORT": str(port)}
     proc = subprocess.Popen([sys.executable, "-m", "generic_tools.shell.mcp_server"], env=env)
     url = f"http://127.0.0.1:{port}/mcp"
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
+    deadline = time.monotonic() + 90  # generous: CI machines can be slow to import the MCP SDK
+    while True:
+        if proc.poll() is not None:
+            raise RuntimeError(f"MCP server exited early with code {proc.returncode}")
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
             break
         except OSError:
+            if time.monotonic() > deadline:
+                proc.kill()
+                raise TimeoutError("MCP server did not start within 90s") from None
             time.sleep(0.2)
     yield url
     proc.terminate()

@@ -57,6 +57,11 @@ class GuardHooks(HookProvider):
         with self._lock:
             self._steering.append(text)
 
+    def external_usage(self, usage: Usage) -> None:
+        """Usage of a model call made outside the agent loop (the context summarizer)."""
+        if self._guard is not None:
+            self._guard.record_external_usage(usage)
+
     @property
     def guard(self) -> RunGuard:
         if self._guard is None:

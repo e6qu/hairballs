@@ -9,11 +9,20 @@ from fakes import ScriptedModel, ToolCall, Turn
 from generic_tools.shell.backends import LocalCorpus, SqliteTicketStore
 from generic_tools.shell.service import GenericTools
 from langchain_core.messages import BaseMessage, HumanMessage, ToolMessage
-from org_agents.conversation import Ack, Acknowledged, Answer, ApprovalRequested, Refused, RunHalted
+from org_agents.conversation import (
+    Ack,
+    Acknowledged,
+    Answer,
+    ApprovalRequested,
+    Refused,
+    Reply,
+    RunFailed,
+    RunHalted,
+)
 from org_agents.core.guard import StopReason
-from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage
+from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage, Idle
 from org_agents.domain import ApprovalDecision, MessageId, PrincipalId, Prompt, SessionId
-from org_agents.shell.audit import MemoryAuditSink, RunStoppedEvent
+from org_agents.shell.audit import MemoryAuditSink, RunFailedEvent, RunFinishedEvent, RunStoppedEvent
 from org_agents.shell.clock import FakeClock
 from org_agents.shell.replies import render
 from org_agents.shell.settings import Settings, load_settings
@@ -210,8 +219,48 @@ def test_cancel_mid_run_stops_before_the_tool_runs() -> None:
     )
     reply = r.handle(chat("open a ticket"))
     assert replies == [Acknowledged(Ack.CANCELLING)]
-    assert isinstance(reply, Answer) and model.calls == 1  # no approval requested, no second turn
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
+    assert render(reply)["reason"] == "cancelled"
+    assert model.calls == 1  # no approval requested, no second turn
     assert tools.get_ticket({"ticket_id": "TCK-000001"}).text.endswith("not found")
+    assert r.handle(chat("next", mid="m2")) == Answer(("never reached",))  # flag cleared
+    # the unanswered create_ticket call was patched before the next model call
+    assert any(m.tool_call_id for m in tool_messages(model.seen_messages[-1]))
+
+
+def test_cancel_during_the_final_model_call_is_reported_as_cancelled() -> None:
+    r, model, _, _ = runner([Turn(text="done anyway")])
+    acks: list[Reply] = []
+    model.on_call = lambda n: acks.append(r.handle(CancelRequest(MessageId("c1"), ALICE)))
+    reply = r.handle(chat("hello"))
+    assert acks == [Acknowledged(Ack.CANCELLING)]
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
+    assert reply.text == "done anyway"
+
+
+def test_model_error_fails_the_run_and_the_thread_recovers() -> None:
+    boom = RuntimeError("ThrottlingException: rate exceeded for key AKIAABCDEFGHIJKLMNOP")
+    r, _, audit, _ = runner([Turn(error=boom), Turn(text="recovered")])
+    reply = r.handle(chat("hello", mid="m1"))
+    assert isinstance(reply, RunFailed)
+    rendered = render(reply)
+    assert rendered["status"] == "failed" and "AKIA" not in str(rendered)
+    assert isinstance(r.state.status, Idle)
+    failed = [e for e in audit.events if isinstance(e, RunFailedEvent)]
+    assert len(failed) == 1 and "AKIA" not in failed[0].error and "ThrottlingException" in failed[0].error
+    assert isinstance(audit.events[-1], RunFinishedEvent)
+    assert r.handle(chat("again", mid="m2")) == Answer(("recovered",))
+
+
+def test_cancel_while_awaiting_approval_returns_thread_to_idle() -> None:
+    call = ToolCall("create_ticket", {"title": "VPN broken", "description": "x"})
+    r, model, _, tools = runner([Turn(tool_calls=(call,)), Turn(text="hello again")])
+    assert isinstance(r.handle(chat("open a ticket", mid="m1")), ApprovalRequested)
+    assert r.handle(CancelRequest(MessageId("c1"), ALICE)) == Acknowledged(Ack.CANCELLING)
+    assert isinstance(r.state.status, Idle)
+    assert r.handle(chat("hi", mid="m2")) == Answer(("hello again",))
+    assert tools.get_ticket({"ticket_id": "TCK-000001"}).text.endswith("not found")
+    assert len(tool_messages(model.seen_messages[-1])) == 1  # the abandoned call was answered
 
 
 def test_follow_up_turn_keeps_history() -> None:

@@ -33,6 +33,6 @@ def disjoint_usage(input_inclusive: int, output: int, cache_read: int, cache_wri
 
 
 def stop_for_usage_limit(message: str) -> StopRun:
-    """Map a ``UsageLimitExceeded`` message to the org stop reason (token limit when unrecognised)."""
-    reason = next((r for name, r in _LIMIT_REASONS if name in message), StopReason.TOKEN_LIMIT)
+    """Map a ``UsageLimitExceeded`` message to the org stop reason (``framework_limit`` when unrecognised)."""
+    reason = next((r for name, r in _LIMIT_REASONS if name in message), StopReason.FRAMEWORK_LIMIT)
     return StopRun(reason, f"framework usage limit: {message.split('. Consider')[0]}")

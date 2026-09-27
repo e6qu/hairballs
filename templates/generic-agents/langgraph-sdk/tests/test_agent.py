@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from fakes import ScriptedModel, ToolCall, Turn
 from generic_tools.shell.backends import LocalCorpus, SqliteTicketStore
-from generic_tools.shell.service import GenericTools
+from generic_tools.shell.service import GenericTools, ToolResult
 from langchain_core.messages import HumanMessage, ToolMessage
 from org_agents.conversation import (
     Ack,
@@ -16,12 +16,13 @@ from org_agents.conversation import (
     ApprovalRequested,
     Refused,
     Reply,
+    RunFailed,
     RunHalted,
 )
 from org_agents.core.guard import StopReason
-from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage
+from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage, Idle
 from org_agents.domain import ApprovalDecision, MessageId, PrincipalId, Prompt, SessionId
-from org_agents.shell.audit import MemoryAuditSink, RunStoppedEvent
+from org_agents.shell.audit import MemoryAuditSink, RunFailedEvent, RunFinishedEvent, RunStoppedEvent
 from org_agents.shell.clock import FakeClock
 from org_agents.shell.replies import render
 from org_agents.shell.settings import Settings, load_settings
@@ -189,8 +190,62 @@ def test_cancel_mid_run_stops_before_next_model_call() -> None:
     model.before_call[0] = lambda: acks.append(r.handle(CancelRequest(MessageId("c1"), ALICE)))
     reply = r.handle(chat("add"))
     assert acks == [Acknowledged(Ack.CANCELLING)]
-    assert reply == Answer(("Run cancelled by the user.",))
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
+    assert reply.text == "Run cancelled by the user."
+    assert render(reply)["reason"] == "cancelled"
     assert model.calls == 1
+    assert r.handle(chat("next", mid="m2")) == Answer(("never",))  # the flag was cleared
+
+
+def test_cancel_during_the_final_model_call_is_reported_as_cancelled() -> None:
+    r, model, _, _ = runner([Turn(text="done anyway")])
+    model.before_call[0] = lambda: r.handle(CancelRequest(MessageId("c1"), ALICE))
+    reply = r.handle(chat("hello"))
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
+    assert reply.text == "done anyway"
+
+
+def test_model_error_fails_the_run_and_the_thread_recovers() -> None:
+    boom = RuntimeError("ThrottlingException: rate exceeded for key AKIAABCDEFGHIJKLMNOP")
+    r, _, audit, _ = runner([Turn(error=boom), Turn(text="recovered")])
+    reply = r.handle(chat("hello", mid="m1"))
+    assert isinstance(reply, RunFailed)
+    rendered = render(reply)
+    assert rendered["status"] == "failed" and "AKIA" not in str(rendered)
+    assert isinstance(r.state.status, Idle)
+    failed = [e for e in audit.events if isinstance(e, RunFailedEvent)]
+    assert len(failed) == 1 and "AKIA" not in failed[0].error and "ThrottlingException" in failed[0].error
+    assert isinstance(audit.events[-1], RunFinishedEvent)
+    assert r.handle(chat("again", mid="m2")) == Answer(("recovered",))
+
+
+def test_tool_crash_fails_the_run_and_dangling_tool_calls_are_answered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    r, model, _, tools = runner(
+        [Turn(tool_calls=(ToolCall("get_ticket", {"ticket_id": "TCK-000001"}),)), Turn(text="ok")]
+    )
+
+    def crash(_: object) -> ToolResult:
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(tools, "get_ticket", crash)
+    assert isinstance(r.handle(chat("get it", mid="m1")), RunFailed)
+    assert r.handle(chat("again", mid="m2")) == Answer(("ok",))
+    kinds = [type(m).__name__ for m in model.seen_messages[-1]]
+    assert kinds[-3:] == ["AIMessage", "ToolMessage", "HumanMessage"]
+
+
+def test_cancel_while_awaiting_approval_returns_thread_to_idle() -> None:
+    call = ToolCall("create_ticket", {"title": "VPN broken", "description": "x"})
+    r, model, _, tools = runner([Turn(tool_calls=(call,)), Turn(text="hello again")])
+    assert isinstance(r.handle(chat("open a ticket", mid="m1")), ApprovalRequested)
+    assert r.handle(CancelRequest(MessageId("c1"), ALICE)) == Acknowledged(Ack.CANCELLING)
+    assert isinstance(r.state.status, Idle)
+    assert r.handle(chat("hi", mid="m2")) == Answer(("hello again",))
+    assert tools.get_ticket({"ticket_id": "TCK-000001"}).text.endswith("not found")
+    kinds = [type(m).__name__ for m in model.seen_messages[-1]]
+    assert kinds[-3:] == ["AIMessage", "ToolMessage", "HumanMessage"]  # every tool call answered
 
 
 def test_turn_limit_is_enforced_by_guard_before_recursion_limit() -> None:

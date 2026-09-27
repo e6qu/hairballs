@@ -9,7 +9,11 @@ What it adds over plain Pydantic AI usage:
 * session persistence (thread state + message history) through a :class:`SessionStore`;
 * context management (tool-output truncation + sliding window) as a history processor;
 * steering mid-run messages into the running agent; follow-ups queued for other senders;
-* cancellation (``AgentRun.cancel``).
+* cancellation (``AgentRun.cancel``): the reply is ``stopped`` / ``cancelled``; a cancel while
+  awaiting approval returns the thread to idle and answers the pending calls as not executed;
+* failures: an exception from the model or framework ends the run as ``Failed`` (thread idle,
+  partial history kept with unanswered tool calls closed, follow-ups kept); Pydantic
+  AI's own ``UsageLimitExceeded`` becomes a ``framework_limit`` stop.
 
 The runner is synchronous (``handle(Incoming) -> Reply``); each run segment is driven with
 ``agent.iter`` on a private event loop.
@@ -30,11 +34,13 @@ from org_agents.conversation import (
     Acknowledged,
     ApprovalNeeded,
     Completed,
+    Failed,
     Refused,
     Reply,
     RunOutcome,
     Stopped,
 )
+from org_agents.core.guard import StopReason
 from org_agents.core.messages import (
     AwaitingApproval,
     CancelRun,
@@ -47,17 +53,19 @@ from org_agents.core.messages import (
     StartRun,
     Steer,
 )
+from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalDecision, ApprovalId, PrincipalId, SessionId, ToolName
 from org_agents.parsing import ParseError
-from org_agents.shell.audit import AuditSink
+from org_agents.shell.audit import AuditSink, ContextCompactedEvent
 from org_agents.shell.clock import Clock
 from org_agents.shell.run_guard import RunGuard
 from org_agents.shell.settings import Settings
 from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults, Tool, ToolApproved, ToolDenied
-from pydantic_ai.exceptions import RunCancelled
-from pydantic_ai.messages import ModelMessage, ModelResponse, ToolCallPart
+from pydantic_ai.exceptions import RunCancelled, UsageLimitExceeded
+from pydantic_ai.messages import ModelMessage, ModelRequest, ModelResponse, ToolCallPart, ToolReturnPart
 from pydantic_ai.models import Model
+from pydantic_ai.run import AgentRun
 from pydantic_ai.settings import ModelSettings
 
 from org_pydantic_harness.core.context import ContextPolicy
@@ -73,7 +81,9 @@ pydantic_ai.BANNER_ENABLED = False
 
 REJECTED = "rejected by approver"
 ONE_APPROVAL_PER_TURN = "not executed: only one approval-gated call is handled per turn; ask again"
-CANCELLED = "The run was cancelled."
+NOT_RUN_FAILED = "not executed: the run failed"
+NOT_RUN_CANCELLED = "not executed: the approval was cancelled"
+CANCEL_DETAIL = "cancelled by request"
 
 HarnessAgent = Agent[HarnessDeps, str | DeferredToolRequests]
 
@@ -114,6 +124,30 @@ def _unanswered_calls(messages: Sequence[ModelMessage]) -> list[str]:
                 if isinstance(p, ToolCallPart) and p.tool_call_id not in answered
             ]
     return []
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """(reply text, audit detail). The reply names only the error class: no message, no stack trace.
+    The audit detail keeps the message, redacted and truncated."""
+    kind = type(exc).__name__
+    return f"the agent run failed ({kind}); please try again", redact(f"{kind}: {exc}").text[:500]
+
+
+def close_unanswered_calls(messages: Sequence[ModelMessage], text: str) -> list[ModelMessage]:
+    """Answer the last response's unanswered tool calls with ``text``, so the history is valid for
+    the next prompt (every tool call paired with a result)."""
+    missing = _unanswered_calls(messages)
+    if not missing:
+        return list(messages)
+    names = {
+        p.tool_call_id: p.tool_name
+        for m in messages
+        if isinstance(m, ModelResponse)
+        for p in m.parts
+        if isinstance(p, ToolCallPart)
+    }
+    parts = [ToolReturnPart(names.get(cid, "unknown"), text, tool_call_id=cid) for cid in missing]
+    return [*messages, ModelRequest(parts=parts)]
 
 
 class Harness:
@@ -158,7 +192,13 @@ class Harness:
 
     def handle(self, message: Incoming) -> Reply:
         with self._lock:
+            before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
+            if isinstance(action, CancelRun):
+                if isinstance(before, Running):
+                    self._steering.cancel()
+                elif isinstance(before, AwaitingApproval):
+                    self._messages = close_unanswered_calls(self._messages, NOT_RUN_CANCELLED)
             self._save_locked()
         match action:
             case StartRun(prompt=prompt):
@@ -169,7 +209,6 @@ class Harness:
             case QueueFollowUp():
                 return Acknowledged(Ack.QUEUED)
             case CancelRun():
-                self._steering.cancel()
                 return Acknowledged(Ack.CANCELLING)
             case DeliverApproval(approval_id=aid, decision=decision):
                 return self._run_with_follow_ups(_Resume(aid, decision), self._owner())
@@ -203,6 +242,7 @@ class Harness:
         outcome, messages = _run_coroutine(self._drive(start, guard, owner))
         guard.finish()
         with self._lock:
+            self._steering.end_run()
             self._messages = messages
             self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
             self._save_locked()
@@ -218,6 +258,7 @@ class Harness:
                 results: DeferredToolResults | None = None
             case _Resume(approval_id=aid, decision=decision):
                 prompt, results = None, self._approval_results(history, aid, decision)
+        run: AgentRun[HarnessDeps, str | DeferredToolRequests] | None = None
         try:
             async with self._agent.iter(
                 prompt,
@@ -235,7 +276,19 @@ class Harness:
                     self._steering.detach(run)
                 result = run.result
         except RunCancelled as exc:
-            return Completed(CANCELLED), exc.all_messages()
+            stop = guard.record_external_stop(StopReason.CANCELLED, CANCEL_DETAIL)
+            return Stopped(stop, stop_text(stop)), close_unanswered_calls(exc.all_messages(), stop_text(stop))
+        except UsageLimitExceeded as exc:
+            # Pydantic AI's default UsageLimits (e.g. request_limit=50) sit behind the org limits.
+            stop = guard.record_external_stop(StopReason.FRAMEWORK_LIMIT, str(exc).split(". Consider")[0])
+            partial = run.all_messages() if run is not None else history
+            return Stopped(stop, stop_text(stop)), close_unanswered_calls(partial, stop_text(stop))
+        except Exception as exc:  # model provider / framework error (throttling, validation, network…)
+            public, detail = describe_failure(exc)
+            guard.fail(detail)
+            # Keep what happened (a tool that ran stays in the history), close unanswered calls.
+            partial = run.all_messages() if run is not None else history
+            return Failed(public), close_unanswered_calls(partial, NOT_RUN_FAILED)
         if result is None:  # pragma: no cover - iteration always ends with a result
             raise RuntimeError("agent run ended without a result")
         return self._outcome(result.output, guard), result.all_messages()
@@ -291,6 +344,10 @@ def create_harness(
     tool list is fixed for the session and the system prompt is sent as ``instructions`` (stable,
     cache-friendly, never trimmed by the context window).
     """
+
+    def compacted(before: int, after: int) -> None:
+        audit.emit(ContextCompactedEvent(session, before, after, clock.now()))
+
     agent: HarnessAgent = Agent(
         model,
         output_type=[str, DeferredToolRequests],
@@ -299,7 +356,7 @@ def create_harness(
         name=settings.agent.name,
         tools=tools,
         model_settings=model_settings,
-        capabilities=[context_capability(context or ContextPolicy.default())],
+        capabilities=[context_capability(context or ContextPolicy.default(), compacted)],
     )
     return Harness(
         agent,

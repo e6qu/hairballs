@@ -26,9 +26,11 @@ Everything else comes from the harness. Compared with [`pydantic-sdk`](../pydant
 | Limits | Turns, total tokens, **USD budget**, wall clock, tool calls, loop detection (identical call ×3), kill switch. Enforced by `org_agents` `RunGuard` through the harness's `GuardCapability`: `before_model_request` → `SkipModelRequest` with the stop reason, `after_model_request` → usage, and `before_tool_execute` → `SkipToolExecution` |
 | Tool policy | Allowlist and approval-required globs in `config/agent.toml`. A registered tool that is not in the allowlist is blocked by the guard and audited. A tool name the model invents is refused by Pydantic AI itself ("Unknown tool name"), because it is not registered |
 | Approval | `before_tool_execute` raises `ApprovalRequired`, so the run ends with `DeferredToolRequests`. The reply is `approval_required` with the approvers. An approver sends `{"approval": {"id", "decision"}}` and the harness resumes with `DeferredToolResults`: approve → `True`, reject → `ToolDenied("rejected by approver")`. The tool runs as the requester, with the idempotency key from the session and its arguments |
-| Messages mid-run | Pure thread state machine (`org_agents.core.thread`). The run owner **steers** through `AgentRun.enqueue(priority="asap")`: the text reaches the model on its next request. Other users are **queued** as follow-ups. Duplicates are ignored. Cancel → `AgentRun.cancel()` |
+| Messages mid-run | Pure thread state machine (`org_agents.core.thread`). The run owner **steers** through `AgentRun.enqueue(priority="asap")`: the text reaches the model on its next request. Other users are **queued** as follow-ups. Duplicates are ignored |
+| Cancel | During a run: `AgentRun.cancel()`, reply `stopped` / `cancelled`. While awaiting approval: the thread goes back to idle and the pending call is answered "not executed" |
+| Failures | An exception from the model or Pydantic AI (throttling, validation…) ends the run with `{"status": "failed", "error": ...}` naming only the error class (redacted details in the `run_failed` audit event). Partial history is kept, unanswered tool calls are closed, the thread is idle and queued follow-ups still run. Pydantic AI's own `UsageLimitExceeded` becomes `stopped` / `framework_limit` |
 | Sessions | Thread state and Pydantic AI message history are saved after every step (`SESSIONS_DIR` → JSON-file store; otherwise in memory). A new process resumes the conversation and any pending approval |
-| Context | Tool results over 2,000 chars → head + tail + marker. The history is kept to a sliding window (`[context]` in `config/agent.toml`) that never splits a tool call from its result |
+| Context | Tool results over 2,000 chars → head + tail + marker. The history is kept to a sliding window (`[context]` in `config/agent.toml`) that never splits a tool call from its result; each trim emits a `context_compacted` audit event |
 | Caching | `bedrock_cache_instructions`, `bedrock_cache_tool_definitions` and `bedrock_cache_messages`, applied where the model supports them. The system prompt is sent as stable `instructions` and the tool list is fixed |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
 | Identity | The caller's Auth0 JWT (validated by the AgentCore Runtime `customJWTAuthorizer`) is forwarded in `Authorization`. `sub` becomes the principal and reaches tools as `RunContext[HarnessDeps].deps.principal` |
@@ -72,7 +74,7 @@ curl -s localhost:8080/invocations -H 'Content-Type: application/json' \
 - `{"cancel": true}`
 - `{"approval": {"id", "decision": "approve"|"reject"}}`
 
-**Replies:** `completed`, `approval_required`, `stopped`, `steered`, `queued`, `cancelling`, `duplicate`, `refused`, `invalid_request`.
+**Replies:** `completed`, `approval_required`, `stopped`, `failed`, `steered`, `queued`, `cancelling`, `duplicate`, `refused`, `invalid_request`.
 
 ## Deploy (current AgentCore)
 

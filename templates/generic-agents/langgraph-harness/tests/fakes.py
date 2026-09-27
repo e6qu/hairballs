@@ -34,6 +34,7 @@ class Turn:
     tool_calls: tuple[ToolCall, ...] = ()
     input_tokens: int = 100
     output_tokens: int = 20
+    error: Exception | None = None  # raised instead of answering (a provider/framework failure)
 
 
 class ScriptedModel(BaseChatModel):
@@ -66,6 +67,8 @@ class ScriptedModel(BaseChatModel):
         exhausted = self.calls >= len(self.turns)
         turn = Turn(text="(script exhausted)") if exhausted else self.turns[self.calls]
         self.calls += 1
+        if turn.error is not None:
+            raise turn.error
         message = AIMessage(
             content=turn.text,
             tool_calls=[

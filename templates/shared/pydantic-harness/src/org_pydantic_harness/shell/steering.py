@@ -45,6 +45,7 @@ class Steering:
         self._run: AgentRun[HarnessDeps, Any] | None = None
         self._buffer: list[str] = []
         self._enqueued: dict[str, str] = {}
+        self._cancel_pending = False
 
     def steer(self, text: str) -> None:
         with self._lock:
@@ -53,13 +54,19 @@ class Steering:
                 return
             self._enqueue_locked(self._run, text)
 
-    def cancel(self) -> bool:
-        """Cancel the active run, if any. Returns whether there was one."""
+    def cancel(self) -> None:
+        """Cancel the active run. The harness calls this only while its thread is running; a cancel
+        that arrives before the run is attached is applied on :meth:`attach`."""
         with self._lock:
             if self._run is None:
-                return False
-            self._run.cancel()
-            return True
+                self._cancel_pending = True
+            else:
+                self._run.cancel()
+
+    def end_run(self) -> None:
+        """The thread's run finished: forget a cancel that no run picked up."""
+        with self._lock:
+            self._cancel_pending = False
 
     def attach(self, run: AgentRun[HarnessDeps, Any]) -> None:
         with self._lock:
@@ -67,6 +74,9 @@ class Steering:
             for text in self._buffer:
                 self._enqueue_locked(run, text)
             self._buffer.clear()
+            if self._cancel_pending:
+                self._cancel_pending = False
+                run.cancel()
 
     def detach(self, run: AgentRun[HarnessDeps, Any]) -> None:
         with self._lock:

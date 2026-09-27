@@ -8,11 +8,26 @@ import pytest
 from fakes import ScriptedModel, ToolCall, Turn
 from generic_tools.shell.backends import LocalCorpus, SqliteTicketStore
 from generic_tools.shell.service import GenericTools
-from org_agents.conversation import Ack, Acknowledged, Answer, ApprovalRequested, Refused, Reply, RunHalted
+from org_agents.conversation import (
+    Ack,
+    Acknowledged,
+    Answer,
+    ApprovalRequested,
+    Refused,
+    Reply,
+    RunFailed,
+    RunHalted,
+)
 from org_agents.core.guard import StopReason
-from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage
+from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage, Idle
 from org_agents.domain import ApprovalDecision, MessageId, PrincipalId, Prompt, SessionId
-from org_agents.shell.audit import MemoryAuditSink, RunStoppedEvent, ToolDecisionEvent
+from org_agents.shell.audit import (
+    MemoryAuditSink,
+    RunFailedEvent,
+    RunFinishedEvent,
+    RunStoppedEvent,
+    ToolDecisionEvent,
+)
 from org_agents.shell.clock import FakeClock
 from org_agents.shell.replies import render
 from org_agents.shell.settings import Settings, load_settings
@@ -206,9 +221,52 @@ def test_cancel_mid_run() -> None:
     )
     acks: list[Reply] = []
     model.during[0] = lambda: acks.append(r.handle(CancelRequest(MessageId("c1"), ALICE)))
-    assert r.handle(chat("add")) == Answer(("Run cancelled.",))
+    reply = r.handle(chat("add"))
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
+    assert render(reply)["reason"] == "cancelled"
     assert acks == [Acknowledged(Ack.CANCELLING)]
     assert model.calls == 1
+    assert isinstance(r.state.status, Idle)
+    assert r.handle(chat("next", mid="m2")) == Answer(("never reached",))
+    (closed,) = tool_returns(model.seen_messages[-1])  # the cancelled call got a result
+    assert "not executed" in str(closed.content)
+
+
+def test_model_error_fails_the_run_and_the_thread_recovers() -> None:
+    boom = RuntimeError("ThrottlingException: rate exceeded for key AKIAABCDEFGHIJKLMNOP")
+    r, model, audit, _ = runner([Turn(error=boom), Turn(text="recovered")])
+    reply = r.handle(chat("hello", mid="m1"))
+    assert isinstance(reply, RunFailed)
+    rendered = render(reply)
+    assert rendered["status"] == "failed" and "AKIA" not in str(rendered)
+    assert isinstance(r.state.status, Idle)
+    failed = [e for e in audit.events if isinstance(e, RunFailedEvent)]
+    assert len(failed) == 1 and "AKIA" not in failed[0].error and "ThrottlingException" in failed[0].error
+    assert isinstance(audit.events[-1], RunFinishedEvent)
+    assert r.handle(chat("again", mid="m2")) == Answer(("recovered",))
+    history = model.seen_messages[-1]
+    assert [t for m in history for t in user_texts(m)] == ["hello", "again"]  # partial history kept
+
+
+def test_failed_run_keeps_queued_follow_ups() -> None:
+    r, model, _, _ = runner([Turn(error=RuntimeError("boom")), Turn(text="bob's answer")])
+    acks: list[Reply] = []
+    model.during[0] = lambda: acks.append(r.handle(chat("mine", mid="m2", who=BOB)))
+    # the follow-up still runs; the shared `merge_answers` keeps only the later reply
+    assert r.handle(chat("hi")) == Answer(("bob's answer",))
+    assert acks == [Acknowledged(Ack.QUEUED)]
+
+
+def test_cancel_while_awaiting_approval_returns_thread_to_idle() -> None:
+    call = ToolCall("create_ticket", {"title": "VPN broken", "description": "x"})
+    r, model, _, tools = runner([Turn(tool_calls=(call,)), Turn(text="hello again")])
+    assert isinstance(r.handle(chat("open a ticket", mid="m1")), ApprovalRequested)
+    assert r.handle(CancelRequest(MessageId("c1"), ALICE)) == Acknowledged(Ack.CANCELLING)
+    assert isinstance(r.state.status, Idle)
+    assert r.handle(chat("hi", mid="m2")) == Answer(("hello again",))
+    assert tools.get_ticket({"ticket_id": "TCK-000001"}).text.endswith("not found")
+    (closed,) = tool_returns(model.seen_messages[-1])
+    assert "approval was cancelled" in str(closed.content)
 
 
 @pytest.mark.parametrize("payload", [{"prompt": ""}, {"nope": 1}, "text"])

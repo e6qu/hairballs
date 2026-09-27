@@ -13,12 +13,20 @@ from org_agents.conversation import (
     ApprovalRequested,
     Refused,
     Reply,
+    RunFailed,
     RunHalted,
 )
 from org_agents.core.guard import StopReason
 from org_agents.core.messages import ApprovalResponse, AwaitingApproval, CancelRequest, ChatMessage, Idle
 from org_agents.domain import ApprovalDecision, MessageId, PositiveInt, PrincipalId, Prompt, SessionId
-from org_agents.shell.audit import MemoryAuditSink, RunStoppedEvent, ToolDecisionEvent
+from org_agents.shell.audit import (
+    ContextCompactedEvent,
+    MemoryAuditSink,
+    RunFailedEvent,
+    RunFinishedEvent,
+    RunStoppedEvent,
+    ToolDecisionEvent,
+)
 from org_agents.shell.clock import FakeClock
 from org_agents.shell.settings import load_settings
 from pydantic_ai import RunContext, Tool
@@ -51,6 +59,8 @@ class Outbox:
             return f"echo: {text}"
 
         def dump(size: int) -> str:
+            if size < 0:
+                raise OSError("disk gone")
             return "A" * 1500 + "B" * size + "C" * 700
 
         def send_email(ctx: RunContext[HarnessDeps], to: str, body: str) -> str:
@@ -251,10 +261,73 @@ def test_cancel_mid_run() -> None:
         assert h is not None
         acks.append(h.handle(CancelRequest(MessageId("c1"), ALICE)))
 
-    h, _, _, _ = build([Turn(tool_calls=(ToolCall("echo", {"text": "x"}),), before=owner_cancels)])
-    assert h.handle(chat("long task")) == Answer(("The run was cancelled.",))
+    h, model, _, _ = build(
+        [Turn(tool_calls=(ToolCall("echo", {"text": "x"}),), before=owner_cancels), Turn(text="fresh")]
+    )
+    reply = h.handle(chat("long task"))
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
     assert acks == [Acknowledged(Ack.CANCELLING)]
     assert h.state.status == Idle()
+    assert h.handle(chat("next", mid="m2")) == Answer(("fresh",))
+    issued = {c.tool_call_id for m in model.seen[-1] for c in getattr(m, "tool_calls", [])}
+    assert issued <= {p.tool_call_id for p in tool_returns(model.seen[-1])}  # every call answered
+
+
+def test_model_error_fails_the_run_and_the_thread_recovers() -> None:
+    boom = RuntimeError("ThrottlingException: rate exceeded for key AKIAABCDEFGHIJKLMNOP")
+    h, model, audit, _ = build([Turn(error=boom), Turn(text="recovered")])
+    reply = h.handle(chat("hello", mid="m1"))
+    assert isinstance(reply, RunFailed)
+    assert "AKIA" not in reply.error and "RuntimeError" in reply.error
+    assert h.state.status == Idle()
+    failed = [e for e in audit.events if isinstance(e, RunFailedEvent)]
+    assert len(failed) == 1 and "AKIA" not in failed[0].error and "ThrottlingException" in failed[0].error
+    assert isinstance(audit.events[-1], RunFinishedEvent)
+    assert h.handle(chat("again", mid="m2")) == Answer(("recovered",))
+    assert user_texts(model.seen[-1]) == ["hello", "again"]  # the failed prompt stays in the history
+
+
+def test_failure_after_approval_closes_the_pending_call() -> None:
+    h, model, _, outbox = build(
+        [Turn(tool_calls=(EMAIL,)), Turn(error=RuntimeError("boom")), Turn(text="ok")]
+    )
+    reply = h.handle(chat("email it"))
+    assert isinstance(h.handle(approve(reply, LEAD, "a1", ApprovalDecision.APPROVE)), RunFailed)
+    assert h.state.status == Idle()
+    assert h.handle(chat("next", mid="m2")) == Answer(("ok",))
+    # the approved call ran before the model failed; its result stays in the history
+    assert outbox.sent == [("it@example.com", "auth0|alice")]
+    assert "sent to it@example.com" in str(tool_returns(model.seen[-1])[-1].content)
+
+
+def test_failure_with_unanswered_tool_calls_closes_them() -> None:
+    crash = ToolCall("dump", {"size": -1})  # the toy tool raises OSError for a negative size
+    h, model, audit, _ = build([Turn(tool_calls=(crash,)), Turn(text="ok")])
+    assert isinstance(h.handle(chat("dump", mid="m1")), RunFailed)
+    assert any("OSError" in e.error for e in audit.events if isinstance(e, RunFailedEvent))
+    assert h.handle(chat("next", mid="m2")) == Answer(("ok",))
+    assert "not executed: the run failed" in str(tool_returns(model.seen[-1])[-1].content)
+
+
+def test_cancel_while_awaiting_approval_returns_thread_to_idle() -> None:
+    h, model, _, outbox = build([Turn(tool_calls=(EMAIL,)), Turn(text="hello again")])
+    assert isinstance(h.handle(chat("email it", mid="m1")), ApprovalRequested)
+    assert h.handle(CancelRequest(MessageId("c1"), ALICE)) == Acknowledged(Ack.CANCELLING)
+    assert h.state.status == Idle()
+    assert h.handle(chat("hi", mid="m2")) == Answer(("hello again",))
+    assert outbox.sent == []
+    assert "approval was cancelled" in str(tool_returns(model.seen[-1])[-1].content)
+
+
+def test_framework_usage_limit_is_a_framework_limit_stop() -> None:
+    # Pydantic AI's default request_limit (50) sits behind the org turn limit; lift the org limits.
+    turns = [Turn(tool_calls=(ToolCall("echo", {"text": f"t{i}"}),)) for i in range(60)]
+    env = {"AGENT_MAX_TURNS": "100", "AGENT_MAX_TOOL_CALLS": "100", "AGENT_MAX_TOTAL_TOKENS": "1000000"}
+    h, _, audit, _ = build(turns, env=env)
+    reply = h.handle(chat("loop"))
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.FRAMEWORK_LIMIT
+    assert "request_limit" in reply.stop.detail
+    assert any(isinstance(e, RunStoppedEvent) for e in audit.events)
 
 
 def test_large_tool_output_is_truncated_before_the_model_sees_it() -> None:
@@ -274,7 +347,7 @@ def test_sliding_window_keeps_recent_turns_and_tool_pairs() -> None:
         Turn(tool_calls=(ToolCall("echo", {"text": f"t{i}"}),)) if i % 2 == 0 else Turn(text=f"a{i}")
         for i in range(12)
     ]
-    h, model, _, _ = build(turns, context=small)
+    h, model, audit, _ = build(turns, context=small)
     for n in range(6):
         h.handle(chat(f"q{n}", mid=f"m{n}"))
     last = model.seen[-1]
@@ -284,6 +357,8 @@ def test_sliding_window_keeps_recent_turns_and_tool_pairs() -> None:
     issued = {c.tool_call_id for m in last for c in getattr(m, "tool_calls", [])}
     assert returned <= issued  # no orphaned tool result
     assert len(h.messages) <= 8
+    compacted = [e for e in audit.events if isinstance(e, ContextCompactedEvent)]
+    assert compacted and all(e.messages_after < e.messages_before for e in compacted)
 
 
 @pytest.mark.parametrize("decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])

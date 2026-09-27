@@ -9,14 +9,21 @@ result back into a domain ``RunOutcome``.
   stored history with ``DeferredToolResults`` (``True`` or ``ToolDenied``).
 * Steering: ``AgentRun.enqueue(..., priority="asap")`` injects the owner's message before the next
   model request (or redirects the run into one more request if it would otherwise end).
-* Cancel: ``AgentRun.cancel()``; the partial history is kept (``RunCancelled.all_messages()``).
+* Cancel: ``AgentRun.cancel()``; the partial history is kept (``RunCancelled.all_messages()``) and
+  the reply is ``stopped`` / ``cancelled``. Cancel while awaiting approval returns the thread to idle.
+* Failure: an exception from the model or framework ends the run as ``Failed`` with the partial
+  history kept (the thread is idle again; queued follow-ups still run).
+
+Whenever a run ends early (cancel, failure, usage limit, abandoned approval), tool calls without a
+result are answered "not executed" (:func:`close_unanswered_calls`): Pydantic AI refuses a new
+prompt after unanswered tool calls, and Bedrock needs every toolUse paired with a toolResult.
 """
 
 from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 from generic_tools.shell.service import GenericTools
 from org_agents.conversation import (
@@ -24,11 +31,13 @@ from org_agents.conversation import (
     Acknowledged,
     ApprovalNeeded,
     Completed,
+    Failed,
     Refused,
     Reply,
     RunOutcome,
     Stopped,
 )
+from org_agents.core.guard import StopReason
 from org_agents.core.messages import (
     AwaitingApproval,
     CancelRun,
@@ -41,15 +50,23 @@ from org_agents.core.messages import (
     StartRun,
     Steer,
 )
+from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalDecision, ApprovalId, PrincipalId, SessionId, ToolName
-from org_agents.shell.audit import AuditSink, RunStoppedEvent
+from org_agents.shell.audit import AuditSink
 from org_agents.shell.clock import Clock
 from org_agents.shell.run_guard import RunGuard
 from org_agents.shell.settings import Settings
 from pydantic_ai import Agent, AgentRun, DeferredToolRequests, DeferredToolResults, ToolDenied
 from pydantic_ai.exceptions import RunCancelled, UsageLimitExceeded
-from pydantic_ai.messages import ModelMessage
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    RetryPromptPart,
+    ToolCallPart,
+    ToolReturnPart,
+)
 from pydantic_ai.models import Model
 
 from generic_agent_pydantic.core.usage import stop_for_usage_limit
@@ -64,9 +81,40 @@ from generic_agent_pydantic.shell.tools import build_tools
 
 STEER_PREFIX = "[Message from the user while you were working]"
 REJECTED = "rejected by approver"
+NOT_RUN_FAILED = "not executed: the run failed"
+NOT_RUN_STOPPED = "not executed: the run was stopped"
+NOT_RUN_CANCELLED = "not executed: the approval was cancelled"
 NOT_REVIEWED = "not executed: only one approval can be pending at a time; request it again"
 
 Output = str | DeferredToolRequests
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """(reply text, audit detail). The reply names only the error class: no message, no stack trace.
+    The audit detail keeps the message, redacted and truncated."""
+    kind = type(exc).__name__
+    return f"the agent run failed ({kind}); please try again", redact(f"{kind}: {exc}").text[:500]
+
+
+def close_unanswered_calls(messages: Sequence[ModelMessage], text: str) -> list[ModelMessage]:
+    """Answer the tool calls of the last model response that have no result with ``text``."""
+    for index in range(len(messages) - 1, -1, -1):
+        response = messages[index]
+        if isinstance(response, ModelResponse):
+            answered = {
+                part.tool_call_id
+                for later in messages[index + 1 :]
+                if isinstance(later, ModelRequest)
+                for part in later.parts
+                if isinstance(part, ToolReturnPart | RetryPromptPart)
+            }
+            missing = [
+                ToolReturnPart(part.tool_name, text, tool_call_id=part.tool_call_id)
+                for part in response.parts
+                if isinstance(part, ToolCallPart) and part.tool_call_id not in answered
+            ]
+            return [*messages, ModelRequest(parts=missing)] if missing else list(messages)
+    return list(messages)
 
 
 class SessionRunner:
@@ -101,6 +149,7 @@ class SessionRunner:
         self._pending: DeferredToolRequests | None = None
         self._active: AgentRun[RunDeps, Output] | None = None
         self._steering: list[str] = []
+        self._cancel_pending = False  # a cancel accepted before the run attached
 
     @property
     def state(self) -> ThreadState:
@@ -112,7 +161,10 @@ class SessionRunner:
 
     def handle(self, message: Incoming) -> Reply:
         with self._lock:
+            before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
+            if isinstance(action, CancelRun):
+                self._cancel(before)
         match action:
             case StartRun(prompt=prompt):
                 return self._run_with_follow_ups(prompt.text, None, message.sender)
@@ -122,9 +174,6 @@ class SessionRunner:
             case QueueFollowUp():
                 return Acknowledged(Ack.QUEUED)
             case CancelRun():
-                with self._lock:
-                    if self._active is not None:
-                        self._active.cancel()
                 return Acknowledged(Ack.CANCELLING)
             case DeliverApproval(approval_id=aid, decision=decision):
                 return self._run_with_follow_ups(None, self._results(aid, decision), self._owner())
@@ -132,6 +181,17 @@ class SessionRunner:
                 return Acknowledged(Ack.DUPLICATE)
             case Reject(reason=reason):
                 return Refused(reason)
+
+    # --------------------------------------------------------------- cancel (called under the lock)
+
+    def _cancel(self, before: object) -> None:
+        if isinstance(before, AwaitingApproval):
+            self._history = close_unanswered_calls(self._history, NOT_RUN_CANCELLED)
+            self._pending = None
+        elif self._active is not None:
+            self._active.cancel()
+        else:  # accepted between `receive` and the run starting: applied when it attaches
+            self._cancel_pending = True
 
     # --------------------------------------------------------------- steering
 
@@ -150,6 +210,9 @@ class SessionRunner:
                 for item in self._steering:
                     run.enqueue(item, priority="asap")
                 self._steering.clear()
+                if self._cancel_pending:
+                    run.cancel()
+            self._cancel_pending = False
 
     # --------------------------------------------------------------- runs
 
@@ -216,16 +279,23 @@ class SessionRunner:
             self._history = result.all_messages()
             return self._outcome(result.output, deps.guard)
         except UsageLimitExceeded as exc:
-            # Second line of defence fired before the guard: surface it as an org stop, audited.
+            # Second line of defence fired before the guard: surface it as an org stop, audited. The
+            # limit name maps to the specific org reason; an unrecognised one is `framework_limit`.
             if run is not None:
-                self._history = run.all_messages()
-            stop = deps.guard.stopped or stop_for_usage_limit(str(exc))
-            if deps.guard.stopped is None:
-                self._audit.emit(RunStoppedEvent(self._session, stop, self._clock.now()))
+                self._history = close_unanswered_calls(run.all_messages(), NOT_RUN_STOPPED)
+            mapped = stop_for_usage_limit(str(exc))
+            stop = deps.guard.record_external_stop(mapped.reason, mapped.detail)
             return Stopped(stop, stopped_text(stop))
         except RunCancelled as exc:
-            self._history = exc.all_messages()
-            return Completed("Run cancelled.")
+            self._history = close_unanswered_calls(exc.all_messages(), NOT_RUN_STOPPED)
+            stop = deps.guard.record_external_stop(StopReason.CANCELLED, "cancelled by request")
+            return Stopped(stop, stopped_text(stop))
+        except Exception as exc:  # model provider / framework error (throttling, validation, network…)
+            public, detail = describe_failure(exc)
+            deps.guard.fail(detail)
+            partial = run.all_messages() if run is not None else self._history
+            self._history, self._pending = close_unanswered_calls(partial, NOT_RUN_FAILED), None
+            return Failed(public)
         finally:
             self._attach(None)
 

@@ -1,8 +1,9 @@
 """LangChain v1 agent middleware that connects the ``create_agent`` loop to the org RunGuard (shell).
 
-* ``before_model`` (graph node): inject queued steering messages; honour cancellation; ask the
-  guard (turns, budget, wall clock, kill switch). A stop appends a final ``AIMessage`` and jumps
-  to ``end``, so the checkpointed history stays well formed.
+* ``before_model`` (graph node): inject queued steering messages; honour cancellation (recorded
+  on the guard as ``StopReason.CANCELLED``); ask the guard (turns, budget, wall clock, kill
+  switch). A stop appends a final ``AIMessage`` and jumps to ``end``, so the checkpointed history
+  stays well formed.
 * ``after_model`` (graph node): parse ``AIMessage.usage_metadata`` into org ``Usage`` and report it.
 * ``wrap_tool_call`` (inside the ``tools`` node, once per tool call): tool policy, loop detection
   and the human-approval ``interrupt()``. A blocked call becomes an error ``ToolMessage``.
@@ -21,7 +22,7 @@ from langchain.agents.middleware import AgentMiddleware, AgentState, ToolCallReq
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langgraph.runtime import Runtime
 from langgraph.types import Command, interrupt
-from org_agents.core.guard import StopRun
+from org_agents.core.guard import StopReason, StopRun
 from org_agents.domain import ApprovalDecision, ToolName
 from org_agents.parsing import ParseError
 from org_agents.shell.run_guard import BlockTool, Proceed, RequireApproval, RunGuard
@@ -31,6 +32,7 @@ from generic_agent_langgraph.shell.tools import RunContext
 
 STEER_PREFIX = "[Message from the user while you were working]"
 CANCELLED_TEXT = "Run cancelled by the user."
+CANCEL_DETAIL = "cancelled by request"
 APPROVAL_INTERRUPT = "approval"
 
 
@@ -55,19 +57,24 @@ class GuardMiddleware(AgentMiddleware[AgentState[Any], RunContext]):
 
     # --------------------------------------------------------------- lifecycle (called by the runner)
 
-    def begin(self, guard: RunGuard, *, fresh_prompt: bool) -> None:
+    def begin(self, guard: RunGuard) -> None:
         with self._lock:
             self._guard = guard
-            if fresh_prompt:
-                self._cancelled = False
 
     def steer(self, text: str) -> None:
         with self._lock:
             self._steering.append(text)
 
     def cancel(self) -> None:
+        """Called by the runner only while a run is in progress; cleared when that run finishes."""
         with self._lock:
             self._cancelled = True
+
+    def end(self) -> bool:
+        """Called by the runner when a run finishes; returns whether it was cancelled."""
+        with self._lock:
+            cancelled, self._cancelled = self._cancelled, False
+            return cancelled
 
     @property
     def guard(self) -> RunGuard:
@@ -83,6 +90,8 @@ class GuardMiddleware(AgentMiddleware[AgentState[Any], RunContext]):
             pending = list(self._steering)
             self._steering.clear()
             cancelled = self._cancelled
+            if cancelled:
+                self.guard.record_external_stop(StopReason.CANCELLED, CANCEL_DETAIL)
             decision = None if cancelled else self.guard.before_model_call()
         # Steering is a HumanMessage appended to the (append-only) history. Bedrock Converse needs
         # strict user/assistant alternation; ChatBedrockConverse merges consecutive user-side

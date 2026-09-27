@@ -16,11 +16,13 @@ from org_agents.conversation import (
     Acknowledged,
     ApprovalNeeded,
     Completed,
+    Failed,
     Refused,
     Reply,
     RunOutcome,
     Stopped,
 )
+from org_agents.core.guard import StopReason
 from org_agents.core.messages import (
     AwaitingApproval,
     CancelRun,
@@ -33,19 +35,30 @@ from org_agents.core.messages import (
     StartRun,
     Steer,
 )
+from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalId, PrincipalId, SessionId, ToolName
 from org_agents.parsing import ParseError, expect_mapping
-from org_agents.shell.audit import AuditSink
+from org_agents.shell.audit import AuditSink, ContextCompactedEvent
 from org_agents.shell.clock import Clock
 from org_agents.shell.run_guard import RunGuard
 from org_agents.shell.settings import Settings
-from strands import Agent
-from strands.agent.conversation_manager import SlidingWindowConversationManager
+from strands import Agent, Snapshot
 from strands.models import Model
 
+from generic_agent_strands.shell.context import AuditedSlidingWindow
 from generic_agent_strands.shell.hooks import GuardHooks
 from generic_agent_strands.shell.tools import build_tools
+
+# Strands' own loop limits (``limits=`` on invoke). Not configured here, but mapped if a developer adds them.
+FRAMEWORK_LIMIT_STOPS = frozenset({"limit_output_tokens", "limit_total_tokens", "limit_turns"})
+
+
+def describe_failure(exc: Exception) -> tuple[str, str]:
+    """(reply text, audit detail). The reply names only the error class: no message, no stack trace.
+    The audit detail keeps the message, redacted and truncated."""
+    kind = type(exc).__name__
+    return f"the agent run failed ({kind}); please try again", redact(f"{kind}: {exc}").text[:500]
 
 
 class SessionRunner:
@@ -70,12 +83,19 @@ class SessionRunner:
             tools=list(build_tools(tools)),
             system_prompt=settings.system_prompt,
             hooks=[self._hooks],
-            conversation_manager=SlidingWindowConversationManager(window_size=40),
+            conversation_manager=AuditedSlidingWindow(40, self._compacted),
             callback_handler=None,
         )
         self._state = ThreadState.initial()
         self._lock = threading.Lock()
-        self._pending_interrupt: str | None = None
+        # Set by a cancel request while a run is in progress and passed to Strands as ``cancel_signal``
+        # (it stops at its next cancellation point). Replaced, under the lock, when a run finishes.
+        self._cancel = threading.Event()
+        # Agent state before the current prompt: restored when its run fails or its approval is cancelled.
+        self._rollback: Snapshot | None = None
+
+    def _compacted(self, before: int, after: int) -> None:
+        self._audit.emit(ContextCompactedEvent(self._session, before, after, self._clock.now()))
 
     @property
     def state(self) -> ThreadState:
@@ -83,7 +103,13 @@ class SessionRunner:
 
     def handle(self, message: Incoming) -> Reply:
         with self._lock:
+            before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
+            if isinstance(action, CancelRun):
+                if isinstance(before, Running):
+                    self._cancel.set()  # under the lock: the event belongs to the run in progress
+                elif isinstance(before, AwaitingApproval):
+                    self._abandon_approval()
         match action:
             case StartRun(prompt=prompt):
                 return self._run_with_follow_ups(prompt.text, message.sender)
@@ -93,7 +119,6 @@ class SessionRunner:
             case QueueFollowUp():
                 return Acknowledged(Ack.QUEUED)
             case CancelRun():
-                self._agent.cancel()
                 return Acknowledged(Ack.CANCELLING)
             case DeliverApproval(approval_id=aid, decision=decision):
                 owner = self._owner()
@@ -127,14 +152,44 @@ class SessionRunner:
             self._session, cfg.limits, cfg.price, cfg.tools, self._clock, self._audit, self._kill_switch
         )
         self._hooks.begin(guard)
-        result = self._agent(
-            agent_input, invocation_state={"principal": owner.value, "session": self._session.value}
-        )
-        outcome = self._outcome(result, guard)
+        if isinstance(agent_input, str):  # a new prompt (not an approval resume)
+            self._rollback = self._agent.take_snapshot(preset="session")
+        cancel = self._cancel
+        try:
+            result = self._agent(
+                agent_input,
+                invocation_state={"principal": owner.value, "session": self._session.value},
+                cancel_signal=cancel,
+            )
+        except Exception as exc:  # framework / model provider error (throttling, validation, network…)
+            outcome: RunOutcome = self._failed(exc, guard)
+        else:
+            if cancel.is_set():
+                guard.record_external_stop(StopReason.CANCELLED, "cancelled by request")
+            elif result.stop_reason in FRAMEWORK_LIMIT_STOPS:
+                guard.record_external_stop(StopReason.FRAMEWORK_LIMIT, f"strands stop: {result.stop_reason}")
+            outcome = self._outcome(result, guard)
         guard.finish()
         with self._lock:
+            self._cancel = threading.Event()
             self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
         return reply
+
+    def _failed(self, exc: Exception, guard: RunGuard) -> Failed:
+        public, detail = describe_failure(exc)
+        guard.fail(detail)
+        self._restore()  # drop the failed prompt's partial turns so the next prompt starts clean
+        return Failed(public)
+
+    def _abandon_approval(self) -> None:
+        # The thread is idle again. Strands still holds the pending interrupt (it only accepts
+        # interrupt responses next), and the history ends with an unanswered toolUse: roll back.
+        self._restore()
+
+    def _restore(self) -> None:
+        if self._rollback is not None:
+            self._agent.load_snapshot(self._rollback)
+            self._rollback = None
 
     @staticmethod
     def _outcome(result: Any, guard: RunGuard) -> RunOutcome:

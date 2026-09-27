@@ -24,6 +24,7 @@ class Turn:
     tool_calls: tuple[ToolCall, ...] = ()
     input_tokens: int = 100
     output_tokens: int = 20
+    error: Exception | None = None  # raised instead of responding (a provider/framework failure)
 
 
 @dataclass
@@ -47,6 +48,8 @@ class ScriptedModel:
         self.calls += 1
         if index in self.during:
             self.during[index]()
+        if turn.error is not None:
+            raise turn.error
         parts: list[TextPart | ToolCallPart] = [TextPart(turn.text)] if turn.text else []
         # Tool call ids are unique per turn, as a real model's are.
         parts += [ToolCallPart(c.name, c.args, tool_call_id=f"{c.id}-{index}") for c in turn.tool_calls]

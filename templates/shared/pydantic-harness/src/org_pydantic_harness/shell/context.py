@@ -12,7 +12,7 @@ history), so trimming old turns never drops it.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 
 from pydantic_ai.capabilities import ProcessHistory
@@ -82,8 +82,15 @@ def compact_history(messages: Sequence[ModelMessage], policy: ContextPolicy) -> 
     return truncated[start:]
 
 
-def context_capability(policy: ContextPolicy) -> ProcessHistory[HarnessDeps]:
+def context_capability(
+    policy: ContextPolicy, on_compacted: Callable[[int, int], None] | None = None
+) -> ProcessHistory[HarnessDeps]:
+    """``on_compacted(before, after)`` is called when the window drops messages (for the audit log)."""
+
     def processor(messages: list[ModelMessage]) -> list[ModelMessage]:
-        return compact_history(messages, policy)
+        compacted = compact_history(messages, policy)
+        if on_compacted is not None and len(compacted) < len(messages):
+            on_compacted(len(messages), len(compacted))
+        return compacted
 
     return ProcessHistory(processor)

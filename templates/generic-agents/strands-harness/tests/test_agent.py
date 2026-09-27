@@ -9,11 +9,19 @@ import pytest
 from fakes import ScriptedModel, ToolCall, Turn
 from generic_tools.shell.backends import LocalCorpus, SqliteTicketStore
 from generic_tools.shell.service import GenericTools
-from org_agents.conversation import Ack, Acknowledged, Answer, ApprovalRequested, Refused, RunHalted
+from org_agents.conversation import (
+    Ack,
+    Acknowledged,
+    Answer,
+    ApprovalRequested,
+    Refused,
+    RunFailed,
+    RunHalted,
+)
 from org_agents.core.guard import StopReason
-from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage
+from org_agents.core.messages import ApprovalResponse, CancelRequest, ChatMessage, Idle
 from org_agents.domain import ApprovalDecision, MessageId, PrincipalId, Prompt, SessionId
-from org_agents.shell.audit import MemoryAuditSink, RunStoppedEvent
+from org_agents.shell.audit import MemoryAuditSink, RunFailedEvent, RunFinishedEvent, RunStoppedEvent
 from org_agents.shell.clock import FakeClock
 from org_agents.shell.replies import render
 from org_agents.shell.settings import Settings, load_settings
@@ -145,6 +153,48 @@ def test_steering_is_injected_before_next_model_call() -> None:
     assert any("also mention the unit" in block.get("text", "") for block in first_user)
 
 
+def test_model_error_fails_the_run_and_the_thread_recovers() -> None:
+    boom = RuntimeError("ThrottlingException: rate exceeded for key AKIAABCDEFGHIJKLMNOP")
+    r, model, audit, _ = runner([Turn(error=boom), Turn(text="recovered")])
+    reply = r.handle(chat("hello", mid="m1"))
+    assert isinstance(reply, RunFailed)
+    rendered = render(reply)
+    assert rendered["status"] == "failed" and "AKIA" not in str(rendered)
+    assert isinstance(r.state.status, Idle)
+    failed = [e for e in audit.events if isinstance(e, RunFailedEvent)]
+    assert len(failed) == 1 and "AKIA" not in failed[0].error and "ThrottlingException" in failed[0].error
+    assert isinstance(audit.events[-1], RunFinishedEvent)
+    assert r.handle(chat("again", mid="m2")) == Answer(("recovered",))
+    # the failed prompt was rolled back, so the history alternates user/assistant cleanly
+    assert [m["role"] for m in model.seen_messages[-1]] == ["user"]
+
+
+def test_cancel_during_a_run_stops_it_as_cancelled() -> None:
+    r, model, audit, _ = runner(
+        [
+            Turn(tool_calls=(ToolCall("calculate", {"expression": "1+1"}),)),
+            Turn(text="never delivered"),
+            Turn(text="fresh start"),
+        ]
+    )
+    model.on_call = lambda n: r.handle(CancelRequest(MessageId("c1"), ALICE)) if n == 1 else None
+    reply = r.handle(chat("add", mid="m1"))
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.CANCELLED
+    assert render(reply)["reason"] == "cancelled"
+    assert any(isinstance(e, RunStoppedEvent) for e in audit.events)
+    assert r.handle(chat("next", mid="m2")) == Answer(("fresh start",))
+
+
+def test_cancel_while_awaiting_approval_returns_thread_to_idle() -> None:
+    call = ToolCall("create_ticket", {"title": "VPN broken", "description": "x"})
+    r, _, _, tools = runner([Turn(tool_calls=(call,)), Turn(text="hello again")])
+    assert isinstance(r.handle(chat("open a ticket", mid="m1")), ApprovalRequested)
+    assert r.handle(CancelRequest(MessageId("c1"), ALICE)) == Acknowledged(Ack.CANCELLING)
+    assert isinstance(r.state.status, Idle)
+    assert r.handle(chat("hi", mid="m2")) == Answer(("hello again",))
+    assert tools.get_ticket({"ticket_id": "TCK-000001"}).text.endswith("not found")
+
+
 @pytest.mark.parametrize("payload", [{"prompt": ""}, {"nope": 1}, "text"])
 def test_invalid_payloads_are_rejected_at_boundary(payload: object) -> None:
     from bedrock_agentcore.runtime.context import RequestContext
@@ -185,3 +235,70 @@ def test_context_retrieval_tools_are_allowed_by_policy() -> None:
     policy = settings().agent.tools
     for name in CONTEXT_RETRIEVAL_TOOLS:
         assert decide_tool(ToolName(name), policy) == Allowed()
+
+
+def test_summarizer_usage_is_metered() -> None:
+    import asyncio
+
+    from org_agents.domain import TokenCount, Usage
+
+    from generic_agent_strands_harness.shell.context import MeteredModel
+
+    seen: list[Usage] = []
+    metered = MeteredModel(
+        ScriptedModel([Turn(text="summary", input_tokens=7, output_tokens=3)]), seen.append
+    )
+
+    async def drain() -> None:
+        async for _ in metered.stream([{"role": "user", "content": [{"text": "x"}]}]):
+            pass
+
+    asyncio.run(drain())
+    assert seen == [Usage(TokenCount(7), TokenCount(3), TokenCount(0), TokenCount(0))]
+
+
+def test_external_usage_counts_against_the_run_budget() -> None:
+    from org_agents.domain import TokenCount, Usage
+
+    r, _, _, _ = runner([Turn(text="hi")], env={"AGENT_MAX_USD": "0.10"})
+    seen: list[StopReason | None] = []
+
+    def summarizer_call(n: int) -> None:
+        # what the context manager does before a model call, via the MeteredModel callback
+        r._hooks.external_usage(Usage(TokenCount(100_000), TokenCount(0), TokenCount(0), TokenCount(0)))
+        stopped = r._hooks.guard.stopped
+        seen.append(stopped.reason if stopped else None)
+
+    r._hooks.external_usage(
+        Usage(TokenCount(1), TokenCount(1), TokenCount(0), TokenCount(0))
+    )  # no run: ignored
+    model = r._agent.model
+    assert isinstance(model, ScriptedModel)
+    model.on_call = summarizer_call
+    reply = r.handle(chat("hello"))
+    assert seen == [StopReason.BUDGET]
+    assert isinstance(reply, RunHalted) and reply.stop.reason is StopReason.BUDGET
+
+
+def test_context_compaction_is_audited() -> None:
+    import asyncio
+
+    from org_agents.shell.audit import ContextCompactedEvent
+    from strands.experimental.context_manager import ContextState
+
+    from generic_agent_strands_harness.shell.context import AuditedStrategy
+
+    class DropOldest:
+        name = "drop-oldest"
+
+        async def apply(self, context: ContextState) -> bool:
+            del context.messages[:2]
+            return True
+
+    r, _, audit, _ = runner([Turn(text="hi")])
+    strategy = AuditedStrategy(DropOldest(), r._compacted)
+    messages: list[object] = [{"role": "user", "content": []}] * 3
+    state = ContextState(messages=messages, agent=r._agent, utilization=0.9)  # type: ignore[arg-type]
+    assert asyncio.run(strategy.apply(state))
+    compacted = [e for e in audit.events if isinstance(e, ContextCompactedEvent)]
+    assert [(e.messages_before, e.messages_after) for e in compacted] == [(3, 1)]

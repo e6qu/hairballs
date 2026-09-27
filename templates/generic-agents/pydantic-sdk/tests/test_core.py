@@ -31,7 +31,7 @@ def test_inconsistent_counts_clamp_to_zero() -> None:
         ),
         ("Exceeded the total_tokens_limit of 200000 (total_tokens=210000)", StopReason.TOKEN_LIMIT),
         ("Exceeded the `cost_limit` of 1", StopReason.BUDGET),
-        ("something new", StopReason.TOKEN_LIMIT),
+        ("something new", StopReason.FRAMEWORK_LIMIT),
     ],
 )
 def test_usage_limit_messages_map_to_stop_reasons(message: str, reason: StopReason) -> None:
