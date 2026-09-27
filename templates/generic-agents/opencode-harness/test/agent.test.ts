@@ -29,7 +29,7 @@ import { OTHER_PRINCIPAL_REASON } from "../src/core/identity.ts";
 import { Registry } from "../src/shell/app.ts";
 import type { OpencodeHost } from "../src/shell/opencodeHost.ts";
 import { STEER_PREFIX } from "../src/shell/runner.ts";
-import { ALICE, hasUv, LEAD, settings, World } from "./support/world.ts";
+import { ALICE, BOB, callerOf, hasUv, LEAD, send, settings, World } from "./support/world.ts";
 
 const chat = (text: string, mid = "m1", who: PrincipalId = ALICE) =>
   chatMessage(MessageId.of(mid), who, Prompt.of(text));
@@ -62,7 +62,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       { text: "The result is 0.3." },
     ]);
     const { runner } = world.thread();
-    const reply = await runner.handle(chat("what is 0.1 + 0.2?"));
+    const reply = await send(runner, chat("what is 0.1 + 0.2?"));
     assert.deepEqual(reply, { kind: "answer", texts: ["The result is 0.3."] });
     assert.equal(world.model.calls, 2);
     // Only the org tools are offered to the model (built-ins are denied and hidden).
@@ -79,14 +79,14 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       { text: "The ticket was not created." },
     ]);
     const { runner } = world.thread();
-    const approval = approvalOf(await runner.handle(chat("open a ticket")));
-    const reply = await runner.handle(approvalResponse(MessageId.of("a1"), LEAD, approval.approvalId, "reject"));
+    const approval = approvalOf(await send(runner, chat("open a ticket")));
+    const reply = await send(runner, approvalResponse(MessageId.of("a1"), LEAD, approval.approvalId, "reject"));
     assert.deepEqual(reply, { kind: "answer", texts: ["The ticket was not created."] });
     assert.match(await ticketText(world, "TCK-000001"), /not found/);
     assert.match(JSON.stringify(world.model.requests.at(-1)?.messages), /rejected by approver/);
   });
 
-  test("ticket requires four-eyes approval, then is created once by the guard's principal", async () => {
+  test("ticket requires four-eyes approval, then is created once, requested by the run owner", async () => {
     world.model.script([
       {
         toolCalls: [
@@ -97,7 +97,9 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
               title: "VPN broken",
               description: "Cannot connect, contact bob@example.com",
               priority: "high",
-              requested_by: "mallory",
+              requester_id: "usr_mallory",
+              requester_name: "Mallory",
+              requester_email: "mallory@evil.example",
             },
           },
         ],
@@ -105,23 +107,34 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       { text: "Ticket TCK-000001 created." },
     ]);
     const { runner, audit } = world.thread();
-    const approval = approvalOf(await runner.handle(chat("please open a ticket, VPN is broken")));
+    const approval = approvalOf(await send(runner, chat("please open a ticket, VPN is broken")));
     assert.deepEqual([...approval.approvers], [LEAD]); // the requester cannot self-approve
     assert.equal(approval.tool, "create_ticket");
+    // Approvers see who asked (PII in the reply only).
+    assert.deepEqual(renderReply(approval)["requester"], {
+      kind: "user",
+      user_id: "usr_alice",
+      name: "Alice",
+      email: "alice@example.com",
+    });
 
-    const self = await runner.handle(approvalResponse(MessageId.of("a1"), ALICE, approval.approvalId, "approve"));
+    const self = await send(runner, approvalResponse(MessageId.of("a1"), ALICE, approval.approvalId, "approve"));
     assert.equal(self.kind, "refused");
 
-    const ok = await runner.handle(approvalResponse(MessageId.of("a2"), LEAD, approval.approvalId, "approve"));
+    const ok = await send(runner, approvalResponse(MessageId.of("a2"), LEAD, approval.approvalId, "approve"));
     assert.deepEqual(ok, { kind: "answer", texts: ["Ticket TCK-000001 created."] });
     const ticket = await ticketText(world, "TCK-000001");
     assert.match(ticket, /VPN broken/);
-    assert.match(ticket, /requested by auth0\|alice/);
+    assert.match(ticket, /requested by Alice <alice@example\.com> \(usr_alice\)/); // the guard's, not the model's
+    assert.doesNotMatch(ticket, /Mallory|mallory/);
     assert.match(await ticketText(world, "TCK-000002"), /not found/); // created exactly once
     assert.ok(audit.events.some((e) => e.kind === "tool_decision" && e.outcome === "needs_approval"));
-    // (opencode's transcript keeps the model's own arguments; the MCP call got the guard's:
-    // requested_by above. The idempotency key is set by the same Object.assign; its derivation is
+    // (opencode's transcript keeps the model's own arguments; the MCP call got the guard's
+    // requester above. The idempotency key is set by the same Object.assign; its derivation is
     // unit-tested in core.test.ts.)
+    // Name and email never reach the audit log.
+    const events = JSON.stringify(audit.events);
+    for (const pii of ["alice@example.com", "Alice", "mallory"]) assert.ok(!events.includes(pii), `${pii} in audit`);
     // tool.execute.after redacted the tool result before the model saw it.
     const toolResults = JSON.stringify(
       world.model.requests.at(-1)?.messages.filter((m) => (m as { role?: string }).role === "tool"),
@@ -130,11 +143,32 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
     assert.doesNotMatch(toolResults, /bob@example\.com/);
   });
 
+  test("the model is told the first name in the first user message only, never in the system prompt", async () => {
+    world.model.script([{ text: "Hi Alice." }, { text: "Sure." }]);
+    const { runner } = world.thread();
+    await send(runner, chat("hello", "m1"));
+    await send(runner, chat("and again", "m2"));
+    const users = (i: number) =>
+      (world.model.requests.at(i)?.messages ?? [])
+        .filter((m) => (m as { role?: string }).role === "user")
+        .map((m) => JSON.stringify((m as { content?: unknown }).content));
+    const first = users(-2);
+    assert.equal(first.length, 1);
+    assert.match(first[0] ?? "", /\[Context: you are assisting Alice\.\]\\n\\nhello/);
+    const second = users(-1);
+    assert.equal(second.length, 2);
+    assert.doesNotMatch(second[1] ?? "", /assisting/); // same speaker: no second introduction
+    for (const request of world.model.requests.slice(-2)) {
+      const system = JSON.stringify(request.messages.filter((m) => (m as { role?: string }).role === "system"));
+      assert.doesNotMatch(system, /Alice|assisting/);
+    }
+  });
+
   test("loop detection stops the run", async () => {
     const same = { toolCalls: [{ name: "gw_search_knowledge", args: { query: "vpn" } }] };
     world.model.script([same, same, same, same, same, { text: "done" }]);
     const { runner, audit } = world.thread();
-    const reply = await runner.handle(chat("find vpn docs"));
+    const reply = await send(runner, chat("find vpn docs"));
     assert.equal(reply.kind, "run_halted", JSON.stringify(renderReply(reply)));
     assert.equal(reply.kind === "run_halted" && reply.stop.reason, "loop_detected");
     assert.ok(audit.events.some((e) => e.kind === "run_stopped"));
@@ -148,7 +182,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       { text: "never reached" },
     ]);
     const { runner } = world.thread({ AGENT_MAX_USD: "0.10" });
-    const reply = await runner.handle(chat("add"));
+    const reply = await send(runner, chat("add"));
     assert.equal(reply.kind === "run_halted" && reply.stop.reason, "budget", JSON.stringify(renderReply(reply)));
     assert.equal(renderReply(reply)["status"], "stopped");
     assert.equal(world.model.calls, 1);
@@ -157,7 +191,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
   test("kill switch: no model call is made", async () => {
     world.model.script([{ text: "hi" }]);
     const { runner } = world.thread({}, true);
-    const reply = await runner.handle(chat("hello"));
+    const reply = await send(runner, chat("hello"));
     assert.equal(reply.kind === "run_halted" && reply.stop.reason, "kill_switch", JSON.stringify(renderReply(reply)));
     assert.equal(world.model.calls, 0);
   });
@@ -168,7 +202,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       { text: "I cannot do that." },
     ]);
     const { runner, audit } = world.thread();
-    assert.deepEqual(await runner.handle(chat("delete everything")), { kind: "answer", texts: ["I cannot do that."] });
+    assert.deepEqual(await send(runner, chat("delete everything")), { kind: "answer", texts: ["I cannot do that."] });
     assert.ok(
       audit.events.some((e) => e.kind === "tool_decision" && e.tool === "delete_everything" && e.outcome === "denied"),
     );
@@ -178,9 +212,9 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
   test("duplicates are ignored and cancel when idle is refused", async () => {
     world.model.script([{ text: "hello" }]);
     const { runner } = world.thread();
-    await runner.handle(chat("hi", "m1"));
-    assert.deepEqual(await runner.handle(chat("hi", "m1")), { kind: "acknowledged", ack: "duplicate" });
-    assert.equal((await runner.handle(cancelRequest(MessageId.of("c1"), ALICE))).kind, "refused");
+    await send(runner, chat("hi", "m1"));
+    assert.deepEqual(await send(runner, chat("hi", "m1")), { kind: "acknowledged", ack: "duplicate" });
+    assert.equal((await send(runner, cancelRequest(MessageId.of("c1"), ALICE))).kind, "refused");
   });
 
   test("steering: a message from the owner mid-run reaches the next model call", async () => {
@@ -191,9 +225,9 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       { text: "6, and noted." },
     ]);
     const { runner } = world.thread();
-    const running = runner.handle(chat("what is 2*3?", "m1"));
+    const running = send(runner, chat("what is 2*3?", "m1"));
     await world.model.received(1);
-    assert.deepEqual(await runner.handle(chat("also mention the unit", "m2")), { kind: "acknowledged", ack: "steered" });
+    assert.deepEqual(await send(runner, chat("also mention the unit", "m2")), { kind: "acknowledged", ack: "steered" });
     release();
     assert.deepEqual(await running, { kind: "answer", texts: ["6, and noted."] });
     assert.match(JSON.stringify(world.model.requests[1]?.messages), /also mention the unit/);
@@ -205,9 +239,9 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
     const gate = new Promise<void>((resolve) => (release = resolve));
     world.model.script([{ text: "slow", gate }]);
     const { runner } = world.thread();
-    const running = runner.handle(chat("take your time", "m1"));
+    const running = send(runner, chat("take your time", "m1"));
     await world.model.received(1);
-    assert.deepEqual(await runner.handle(cancelRequest(MessageId.of("c1"), ALICE)), {
+    assert.deepEqual(await send(runner, cancelRequest(MessageId.of("c1"), ALICE)), {
       kind: "acknowledged",
       ack: "cancelling",
     });
@@ -221,7 +255,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
     const gate = new Promise<void>((resolve) => (release = resolve));
     world.model.script([{ text: "too late", gate }]);
     const { runner } = world.thread({ AGENT_MAX_WALL_SECONDS: "1" });
-    const reply = await runner.handle(chat("hurry"));
+    const reply = await send(runner, chat("hurry"));
     release();
     assert.equal(reply.kind === "run_halted" && reply.stop.reason, "wall_clock", JSON.stringify(renderReply(reply)));
   });
@@ -229,7 +263,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
   test("identity: opencode is bound to the first prompter's token; another user's prompt is refused", async () => {
     const jwt = (sub: string) =>
       CallerToken.of(`eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ sub })).toString("base64url")}.sig`);
-    const bob = PrincipalId.of("auth0|bob");
+    const bob = BOB;
     const started: (CallerToken | null)[] = [];
     const registry = new Registry({
       settings: settings(),
@@ -243,7 +277,7 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
       killSwitch: () => false,
     });
     const session = SessionId.of("thread-identity-000000000000000000000000001");
-    const as = (sub: string) => ({ callerToken: jwt(sub), workloadAccessToken: null });
+    const as = (who: PrincipalId) => ({ caller: callerOf(who), callerToken: jwt(who), workloadAccessToken: null });
     world.model.script([{ text: "hello alice" }, { text: "hello again" }]);
 
     assert.deepEqual(await registry.handle(session, chat("hi", "m1"), as(ALICE)), { kind: "answer", texts: ["hello alice"] });
@@ -266,9 +300,9 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
   test("a provider error fails the run and the next message starts a new run", async () => {
     world.model.script([{ httpError: { status: 400, message: "model is not available" } }, { text: "back again" }]);
     const { runner } = world.thread();
-    const first = await runner.handle(chat("hello", "m1"));
+    const first = await send(runner, chat("hello", "m1"));
     assert.equal(renderReply(first)["status"], "failed", JSON.stringify(renderReply(first)));
     assert.equal(runner.state.status.kind, "idle");
-    assert.deepEqual(await runner.handle(chat("hello again", "m2")), { kind: "answer", texts: ["back again"] });
+    assert.deepEqual(await send(runner, chat("hello again", "m2")), { kind: "answer", texts: ["back again"] });
   });
 });

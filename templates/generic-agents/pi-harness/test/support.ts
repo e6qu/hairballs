@@ -21,17 +21,26 @@ import type {
 } from "@earendil-works/pi-ai";
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import {
+  type Caller,
+  CallerToken,
   chatMessage,
+  EmailAddress,
   type Env,
   err,
   FakeClock,
+  humanUser,
+  type Incoming,
+  type InvocationContext,
   loadSettings,
   MemoryAuditSink,
   MessageId,
+  PersonName,
   PrincipalId,
   Prompt,
+  type Reply,
   SessionId,
   unwrap,
+  UserId,
 } from "@org/agents";
 
 import { enforceOffline } from "../src/shell/offline.ts";
@@ -51,6 +60,35 @@ export const SESSION = SessionId.of("thread-1-00000000000000000000000000");
 
 export const chat = (text: string, mid = "m1", who: PrincipalId = ALICE) =>
   chatMessage(MessageId.of(mid), who, Prompt.of(text));
+
+function person(subject: PrincipalId, user: string, email: string, given: string | null): Caller {
+  return humanUser({
+    userId: UserId.of(user),
+    subject,
+    email: EmailAddress.of(email),
+    givenName: given === null ? null : PersonName.of(given),
+    familyName: null,
+  });
+}
+
+/** The resolved callers of the test principals (what the IdentityResolver would give). */
+export const CALLERS: ReadonlyMap<PrincipalId, Caller> = new Map([
+  [ALICE, person(ALICE, "usr_alice", "alice@example.com", "Alice")],
+  [BOB, person(BOB, "usr_bob", "bob@example.com", "Bob")],
+  [LEAD, person(LEAD, "usr_lead", "lead@example.com", null)],
+]);
+
+/** The invocation context of a message from `who` (optionally with their JWT). */
+export function contextFor(who: PrincipalId, jwt: string | null = null): InvocationContext {
+  const caller = CALLERS.get(who);
+  if (caller === undefined) throw new Error(`no test caller for ${who}`);
+  return { caller, callerToken: jwt === null ? null : CallerToken.of(jwt), workloadAccessToken: null };
+}
+
+/** Deliver a message as its sender (the way the AgentCore server hands it to the runner). */
+export function send(runner: SessionRunner, message: Incoming, jwt: string | null = null): Promise<Reply> {
+  return runner.handle(message, contextFor(message.sender, jwt));
+}
 
 // ---------------------------------------------------------------- scripted model (faux provider)
 

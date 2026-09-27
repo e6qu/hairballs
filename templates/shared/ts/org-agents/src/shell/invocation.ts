@@ -7,9 +7,10 @@
  *     {"cancel": true, "message_id": "..."}                                    -> CancelRequest
  *     {"approval": {"id": "...", "decision": "approve"}, "message_id": "..."}  -> ApprovalResponse
  *
- * The sender comes from the (already validated) Auth0 JWT forwarded by AgentCore Runtime in the
- * `Authorization` header; locally it defaults to `local-dev`. The raw credentials (the caller's
- * JWT and the Workload Access Token) are parsed into an `InvocationContext` for the handler.
+ * The sender is the resolved caller's `subject` (the Auth0 `sub` of the already validated JWT
+ * forwarded by AgentCore Runtime in the `Authorization` header; locally `local-dev`). The caller
+ * and the raw credentials (the caller's JWT and the Workload Access Token) form the
+ * `InvocationContext` handed to the handler.
  */
 
 import { randomUUID } from "node:crypto";
@@ -24,41 +25,24 @@ import {
   Prompt,
   WorkloadAccessToken,
 } from "../domain.ts";
-import { attempt, expectBool, expectObject, fail, field, hasField, must, type Parsed } from "../parsing.ts";
+import type { Caller } from "../identity.ts";
+import { attempt, expectBool, expectObject, field, hasField, must, type Parsed } from "../parsing.ts";
+import { type HeaderRecord, headerValue, jwtClaimsFromHeaders, LOCAL_USER } from "./identity.ts";
 
-export const LOCAL_PRINCIPAL: PrincipalId = PrincipalId.of("local-dev");
-
-/** Request headers as Node (`IncomingHttpHeaders`) or a plain record gives them. */
-export type HeaderRecord = Readonly<Record<string, string | readonly string[] | undefined>>;
-
-function headerValue(headers: HeaderRecord | Headers, name: string): string | undefined {
-  if (headers instanceof Headers) return headers.get(name) ?? undefined;
-  for (const [key, value] of Object.entries(headers)) {
-    if (key.toLowerCase() !== name) continue;
-    if (typeof value === "string") return value;
-    if (Array.isArray(value)) return value[0] as string | undefined;
-  }
-  return undefined;
-}
+export const LOCAL_PRINCIPAL: PrincipalId = LOCAL_USER.subject;
 
 /**
  * Read `sub` from the Bearer JWT. AgentCore Runtime has already validated the token; we only
  * decode its claims. Without a token (local development) the principal is `local-dev`.
+ * Prefer `IdentityResolver.resolve` for the full caller (profile and org user id).
  */
 export function principalFromHeaders(headers: HeaderRecord | Headers): Parsed<PrincipalId> {
-  const auth = headerValue(headers, "authorization");
-  if (auth === undefined || !auth.toLowerCase().startsWith("bearer ")) return { kind: "ok", value: LOCAL_PRINCIPAL };
-  const parts = auth.slice(7).trim().split(".");
-  const payload = parts[1];
-  if (parts.length !== 3 || payload === undefined) return fail("$.headers.authorization", "is not a JWT");
-  let claims: unknown;
-  try {
-    claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
-  } catch {
-    return fail("$.headers.authorization", "has an undecodable payload");
-  }
+  const claims = jwtClaimsFromHeaders(headers);
+  if (claims.kind === "err") return claims;
+  if (claims.value === null) return { kind: "ok", value: LOCAL_PRINCIPAL };
+  const raw = claims.value;
   return attempt(() => {
-    const fields = must(expectObject(claims, "$.jwt"));
+    const fields = must(expectObject(raw, "$.jwt"));
     return must(PrincipalId.parse(must(field(fields, "sub", "$.jwt")), "$.jwt.sub"));
   });
 }
@@ -67,17 +51,21 @@ export function principalFromHeaders(headers: HeaderRecord | Headers): Parsed<Pr
 export const WORKLOAD_ACCESS_TOKEN_HEADERS = ["workloadaccesstoken", "x-amz-bedrock-agentcore-identity-wat"] as const;
 
 /**
- * Per-request credentials, handed to the invocation handler next to the parsed message. Both are
- * secrets: pass them on (Gateway, AgentCore Identity), never log, audit or render them.
+ * Per-request identity, handed to the invocation handler next to the parsed message: who is
+ * calling (`caller`, whose `subject` is the message's sender) and the raw credentials. The
+ * credentials are secrets: pass them on (Gateway, AgentCore Identity), never log, audit or render
+ * them. The caller's name and email are PII: replies and tool arguments only, never audit events.
  */
 export type InvocationContext = {
+  /** Resolved from the JWT claims by an `IdentityResolver`; `LOCAL_USER` without a token (local development). */
+  readonly caller: Caller;
   /** The caller's validated Auth0 JWT; `null` without `Authorization: Bearer …` (local development). */
   readonly callerToken: CallerToken | null;
   /** AgentCore Identity's Workload Access Token; `null` when the runtime did not send one. */
   readonly workloadAccessToken: WorkloadAccessToken | null;
 };
 
-export const NO_INVOCATION_CONTEXT: InvocationContext = { callerToken: null, workloadAccessToken: null };
+export const NO_INVOCATION_CONTEXT: InvocationContext = { caller: LOCAL_USER, callerToken: null, workloadAccessToken: null };
 
 /** The bearer token of `Authorization: Bearer <jwt>` (scheme case-insensitive), or null. */
 export function callerTokenFromHeaders(headers: HeaderRecord | Headers): Parsed<CallerToken | null> {
@@ -95,8 +83,10 @@ export function workloadAccessTokenFromHeaders(headers: HeaderRecord | Headers):
   return { kind: "ok", value: null };
 }
 
-export function invocationContextFromHeaders(headers: HeaderRecord | Headers): Parsed<InvocationContext> {
+/** The context of a request whose caller has already been resolved (`IdentityResolver.resolve`). */
+export function invocationContextFromHeaders(headers: HeaderRecord | Headers, caller: Caller): Parsed<InvocationContext> {
   return attempt(() => ({
+    caller,
     callerToken: must(callerTokenFromHeaders(headers)),
     workloadAccessToken: must(workloadAccessTokenFromHeaders(headers)),
   }));

@@ -7,6 +7,7 @@ import {
   type Incoming,
   type InvocationContext,
   invocationContextFromHeaders,
+  LOCAL_USER,
   NO_INVOCATION_CONTEXT,
   type Reply,
   type RunningAgentCoreServer,
@@ -64,7 +65,7 @@ test("ping is healthy when idle", async () => {
 test("invocation goes through parse → handler → render", async () => {
   const result = await invoke(
     { prompt: "hi", message_id: "m1" },
-    { [SESSION_HEADER]: "sess-123", authorization: `Bearer ${jwt({ sub: "auth0|42" })}` },
+    { [SESSION_HEADER]: "sess-123", authorization: `Bearer ${jwt({ sub: "auth0|42", email: "u42@example.com" })}` },
   );
   assert.deepEqual(result, { status: 200, json: { status: "completed", answers: ["echo: hi"] } });
   const last = calls.at(-1);
@@ -117,18 +118,19 @@ test("unknown routes are 404", async () => {
 // ---------------------------------------------------------------- invocation context (credentials)
 
 test("the handler receives the caller's JWT and the Workload Access Token", async () => {
-  const token = jwt({ sub: "auth0|42" });
+  const token = jwt({ sub: "auth0|42", email: "u42@example.com" });
   const result = await invoke({ prompt: "ctx", message_id: "ctx1" }, { authorization: `bearer ${token}`, WorkloadAccessToken: "wat-1+/=" });
   assert.equal(result.status, 200);
   const last = calls.at(-1);
-  assert.deepEqual(last?.context, { callerToken: token, workloadAccessToken: "wat-1+/=" });
+  assert.deepEqual({ ...last?.context, caller: undefined }, { caller: undefined, callerToken: token, workloadAccessToken: "wat-1+/=" });
+  assert.equal(last?.context.caller.subject, "auth0|42");
   assert.equal(last?.incoming.sender, "auth0|42");
   assert.doesNotMatch(JSON.stringify(result.json), /wat-1|eyJ/); // never rendered
 });
 
 test("the WAT is also read from X-Amz-Bedrock-AgentCore-Identity-WAT; no headers → empty context", async () => {
   await invoke({ prompt: "ctx" }, { "X-Amz-Bedrock-AgentCore-Identity-WAT": "wat-2" });
-  assert.deepEqual(calls.at(-1)?.context, { callerToken: null, workloadAccessToken: "wat-2" });
+  assert.deepEqual(calls.at(-1)?.context, { caller: LOCAL_USER, callerToken: null, workloadAccessToken: "wat-2" });
   await invoke({ prompt: "ctx" });
   assert.deepEqual(calls.at(-1)?.context, NO_INVOCATION_CONTEXT);
 });
@@ -174,6 +176,7 @@ test("credential parsers: bearer scheme, JWT shape, no value in errors", () => {
   // The Workload Access Token header wins over the alias; names are case-insensitive.
   const both = invocationContextFromHeaders(
     new Headers({ "X-Amz-Bedrock-AgentCore-Identity-WAT": "alias", WORKLOADACCESSTOKEN: "primary" }),
+    LOCAL_USER,
   );
-  assert.deepEqual(both, { kind: "ok", value: { callerToken: null, workloadAccessToken: "primary" } });
+  assert.deepEqual(both, { kind: "ok", value: { caller: LOCAL_USER, callerToken: null, workloadAccessToken: "primary" } });
 });

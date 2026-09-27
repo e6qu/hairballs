@@ -5,10 +5,12 @@
  *   GET  /ping        → {"status": "Healthy"} or {"status": "HealthyBusy"} while invocations run
  *   POST /invocations → body parsed as `unknown` → Incoming → injected handler → render(reply)
  *
- * The session id comes from `x-amzn-bedrock-agentcore-runtime-session-id`, the sender from the
- * forwarded JWT (`principalFromHeaders`). The handler's third argument, an `InvocationContext`,
- * carries the caller's raw JWT and the Workload Access Token (both secrets: never logged here,
- * never in replies) so a variant can forward the user's identity to AgentCore Gateway. Invalid input yields
+ * The session id comes from `x-amzn-bedrock-agentcore-runtime-session-id`; the caller is resolved
+ * from the forwarded JWT's claims by the `IdentityResolver` (`identity` option) and the sender is
+ * its `subject`. The handler's third argument, an `InvocationContext`, carries the caller (profile
+ * and org user id), the raw JWT and the Workload Access Token (both secrets: never logged here,
+ * never in replies) so a variant can forward the user's identity to AgentCore Gateway. Invalid input
+ * (including a human token without an email claim) yields
  * `{"status": "invalid_request", "path": ..., "error": ...}`, like the Python variants.
  */
 
@@ -19,7 +21,9 @@ import type { Reply } from "../core/conversation.ts";
 import type { Incoming } from "../core/messages.ts";
 import { SessionId } from "../domain.ts";
 import { attempt, must, ParseError } from "../parsing.ts";
-import { type InvocationContext, invocationContextFromHeaders, parseIncoming, principalFromHeaders } from "./invocation.ts";
+import { DEFAULT_CLAIMS } from "../identity.ts";
+import { IdentityResolver, InMemoryUserDirectory } from "./identity.ts";
+import { type InvocationContext, invocationContextFromHeaders, parseIncoming } from "./invocation.ts";
 import { dumps } from "./json.ts";
 import { render } from "./replies.ts";
 
@@ -35,6 +39,12 @@ export type InvocationHandler = (session: SessionId, incoming: Incoming, context
 
 export type AgentCoreServerOptions = {
   readonly handler: InvocationHandler;
+  /**
+   * Resolves the caller of each request. Default: the default claim names, a process-local
+   * directory and `LOCAL_USER` for requests without a token; variants pass
+   * `identityResolverFrom(settings.identity, env)`.
+   */
+  readonly identity?: IdentityResolver;
   /** Default `0.0.0.0` (the AgentCore Runtime container contract). */
   readonly host?: string;
   /** Default 8080 (the AgentCore Runtime container contract); 0 picks a free port. */
@@ -87,9 +97,11 @@ const invalid = (error: ParseError): Record<string, unknown> => ({
 });
 
 type Parsed = { readonly session: SessionId; readonly incoming: Incoming; readonly context: InvocationContext };
+type Unresolved = { readonly session: SessionId; readonly raw: unknown };
 
-function parseRequest(request: IncomingMessage, bodyText: string) {
-  return attempt((): Parsed => {
+/** Everything that needs no caller: body JSON, session id, credential shapes (cheap, no directory access). */
+function parseEnvelope(request: IncomingMessage, bodyText: string) {
+  return attempt((): Unresolved => {
     let raw: unknown;
     try {
       raw = JSON.parse(bodyText);
@@ -99,10 +111,19 @@ function parseRequest(request: IncomingMessage, bodyText: string) {
     const header = request.headers[SESSION_HEADER];
     const sessionRaw = (Array.isArray(header) ? header[0] : header) || LOCAL_SESSION;
     const session = must(SessionId.parse(sessionRaw, "$.session"));
-    const sender = must(principalFromHeaders(request.headers));
-    const context = must(invocationContextFromHeaders(request.headers));
-    const incoming = must(parseIncoming(raw, sender));
-    return { session, incoming, context };
+    return { session, raw };
+  });
+}
+
+async function parseRequest(request: IncomingMessage, bodyText: string, identity: IdentityResolver) {
+  const envelope = parseEnvelope(request, bodyText);
+  if (envelope.kind === "err") return envelope;
+  const caller = await identity.resolve(request.headers);
+  if (caller.kind === "err") return caller;
+  return attempt((): Parsed => {
+    const context = must(invocationContextFromHeaders(request.headers, caller.value));
+    const incoming = must(parseIncoming(envelope.value.raw, caller.value.subject));
+    return { session: envelope.value.session, incoming, context };
   });
 }
 
@@ -110,6 +131,7 @@ function parseRequest(request: IncomingMessage, bodyText: string) {
 export function agentCoreRequestListener(
   handler: InvocationHandler,
   onError: (error: unknown) => void = (error) => console.error("invocation failed:", error),
+  identity: IdentityResolver = new IdentityResolver({ names: DEFAULT_CLAIMS, directory: new InMemoryUserDirectory() }),
 ): { readonly listener: (request: IncomingMessage, response: ServerResponse) => void; readonly busy: () => number } {
   let inFlight = 0;
 
@@ -121,7 +143,7 @@ export function agentCoreRequestListener(
       if (error instanceof BodyTooLarge) send(response, 413, invalid(new ParseError("$", "body is too large")));
       return;
     }
-    const parsed = parseRequest(request, bodyText);
+    const parsed = await parseRequest(request, bodyText, identity);
     if (parsed.kind === "err") {
       send(response, 200, invalid(parsed.error));
       return;
@@ -157,7 +179,7 @@ export function agentCoreRequestListener(
 
 /** Start the server and resolve once it is listening. */
 export function startAgentCoreServer(options: AgentCoreServerOptions): Promise<RunningAgentCoreServer> {
-  const { listener } = agentCoreRequestListener(options.handler, options.onError);
+  const { listener } = agentCoreRequestListener(options.handler, options.onError, options.identity);
   const server = createServer(listener);
   const host = options.host ?? "0.0.0.0";
   return new Promise((resolve, reject) => {

@@ -19,6 +19,7 @@ import {
   type AuditSink,
   type Clock,
   type Env,
+  identityResolverFrom,
   type InvocationHandler,
   JsonLinesAuditSink,
   killSwitchFrom,
@@ -49,6 +50,10 @@ export class Registry {
     this.#options = options;
   }
 
+  get settings(): Settings {
+    return this.#options.settings;
+  }
+
   runner(session: SessionId): Promise<SessionRunner> {
     let runner = this.#runners.get(session);
     if (runner === undefined) {
@@ -62,7 +67,8 @@ export class Registry {
 }
 
 export function invocationHandler(registry: Registry): InvocationHandler {
-  // The context carries the caller's JWT: the runner forwards it to the Gateway on tool calls.
+  // The context carries the resolved caller and their JWT: the runner forwards the JWT to the
+  // Gateway on tool calls and records the caller as the requester.
   return async (session, incoming, context) => (await registry.runner(session)).handle(incoming, context);
 }
 
@@ -97,7 +103,9 @@ export async function productionRegistry(env: Env): Promise<Registry> {
 
 async function main(): Promise<void> {
   const registry = await productionRegistry(process.env);
-  const server = await startAgentCoreServer({ handler: invocationHandler(registry) });
+  // Requests without a token act as LOCAL_USER (local runs); REQUIRE_TOKEN=true refuses them.
+  const identity = identityResolverFrom(registry.settings.identity, process.env);
+  const server = await startAgentCoreServer({ handler: invocationHandler(registry), identity });
   console.error(`generic pi agent listening on ${server.url}`);
 }
 

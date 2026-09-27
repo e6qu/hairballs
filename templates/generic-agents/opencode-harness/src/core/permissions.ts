@@ -18,10 +18,11 @@
 
 import {
   assertNever,
+  type Caller,
   decideTool,
+  displayName,
   type Fingerprint,
   idempotencyKey,
-  type PrincipalId,
   type SessionId,
   ToolName,
   type ToolPattern,
@@ -146,19 +147,47 @@ export function decideAsk(permission: string, policy: ToolPolicy, server: McpSer
 
 // ---------------------------------------------------------------- side-effect context
 
+/** Arguments only the guard sets; whatever the model puts there is overwritten. */
+export const HARNESS_ARGUMENTS: readonly string[] = ["requester_id", "requester_name", "requester_email", "idempotency_key"];
+
 /**
- * Arguments the guard (not the model) sets on side-effecting tool calls: who asked for it, and an
- * idempotency key derived from the session, the tool and the model's canonical arguments, so a
- * retried or replayed call cannot create a second ticket.
+ * The model's own arguments, without any harness field it may have tried to set, so they do not
+ * change the idempotency key (`fingerprintArguments(modelArguments(args))`).
+ */
+export function modelArguments(raw: unknown): unknown {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return raw;
+  return Object.fromEntries(Object.entries(raw).filter(([name]) => !HARNESS_ARGUMENTS.includes(name)));
+}
+
+/**
+ * The generic tools' requester fields (PII: name and email go to the ticket, never to audit
+ * events). `requester_id` is the org user id for people (stable across email and name changes)
+ * or the client `sub` for services, which have no email (empty string).
+ */
+export function requesterArguments(caller: Caller): Readonly<Record<string, string>> {
+  switch (caller.kind) {
+    case "human":
+      return { requester_id: caller.userId, requester_name: displayName(caller), requester_email: caller.email };
+    case "service":
+      return { requester_id: caller.subject, requester_name: displayName(caller), requester_email: "" };
+    default:
+      return assertNever(caller);
+  }
+}
+
+/**
+ * Arguments the guard (not the model) sets on side-effecting tool calls: who asked for it (the
+ * run owner's resolved caller), and an idempotency key derived from the session, the tool and the
+ * model's canonical arguments, so a retried or replayed call cannot create a second ticket.
  */
 export function sideEffectArguments(
   session: SessionId,
   tool: ToolName,
-  modelArguments: Fingerprint,
-  requestedBy: PrincipalId,
+  modelArgs: Fingerprint,
+  requester: Caller,
 ): Readonly<Record<string, string>> {
   return {
-    requested_by: requestedBy,
-    idempotency_key: idempotencyKey(session, tool, modelArguments),
+    ...requesterArguments(requester),
+    idempotency_key: idempotencyKey(session, tool, modelArgs),
   };
 }

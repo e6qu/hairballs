@@ -12,15 +12,22 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  type Caller,
+  EmailAddress,
   type Env,
   FakeClock,
+  humanUser,
+  type Incoming,
   loadSettings,
   MemoryAuditSink,
   ModelId,
+  PersonName,
   PrincipalId,
+  type Reply,
   SessionId,
   type Settings,
   unwrap,
+  UserId,
 } from "@org/agents";
 
 import { ModelBackend } from "../../src/domain.ts";
@@ -37,6 +44,35 @@ const TOOLS_DIR = fileURLToPath(new URL("../../../tools", import.meta.url));
 export const hasUv = spawnSync("uv", ["--version"], { stdio: "ignore" }).status === 0;
 export const ALICE = PrincipalId.of("auth0|alice");
 export const LEAD = PrincipalId.of("auth0|service-desk-lead");
+export const BOB = PrincipalId.of("auth0|bob");
+
+function person(subject: PrincipalId, user: string, email: string, given: string | null): Caller {
+  return humanUser({
+    userId: UserId.of(user),
+    subject,
+    email: EmailAddress.of(email),
+    givenName: given === null ? null : PersonName.of(given),
+    familyName: null,
+  });
+}
+
+/** The resolved callers of the test principals (what the IdentityResolver would give). */
+export const CALLERS: ReadonlyMap<PrincipalId, Caller> = new Map([
+  [ALICE, person(ALICE, "usr_alice", "alice@example.com", "Alice")],
+  [BOB, person(BOB, "usr_bob", "bob@example.com", "Bob")],
+  [LEAD, person(LEAD, "usr_lead", "lead@example.com", null)],
+]);
+
+export function callerOf(who: PrincipalId): Caller {
+  const caller = CALLERS.get(who);
+  if (caller === undefined) throw new Error(`no test caller for ${who}`);
+  return caller;
+}
+
+/** Deliver a message to a runner as its sender (the way the Registry hands it over). */
+export function send(runner: SessionRunner, message: Incoming): Promise<Reply> {
+  return runner.handle(message, callerOf(message.sender));
+}
 
 export function settings(env: Env = {}): Settings {
   return unwrap(loadSettings(env, ROOT));

@@ -1,6 +1,7 @@
 /** Conversation domain types shared by all agents: approval policy, run outcomes and replies. */
 
 import { type ApprovalId, PrincipalId, type ToolName } from "../domain.ts";
+import type { Caller } from "../identity.ts";
 import { attempt, expectArray, expectBool, expectObject, fieldOr, must, type Parsed } from "../parsing.ts";
 import { traverse } from "../result.ts";
 import type { StopRun } from "./guard.ts";
@@ -68,6 +69,8 @@ export type ApprovalRequested = {
   readonly tool: ToolName;
   readonly reason: string;
   readonly approvers: ReadonlySet<PrincipalId>;
+  /** Who asked (shown to approvers: name and email are PII); `null` when unknown. */
+  readonly requester: Caller | null;
 };
 export type RunHalted = { readonly kind: "run_halted"; readonly stop: StopRun; readonly text: string };
 export type Acknowledged = { readonly kind: "acknowledged"; readonly ack: Ack };

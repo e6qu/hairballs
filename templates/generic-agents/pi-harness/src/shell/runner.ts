@@ -9,13 +9,19 @@
  *   batch, before the next model call;
  * - anyone else → queued in the thread state and run afterwards as a new run on behalf of the
  *   sender (not pi's `followUp()`, which would run inside the current run and budget, with the
- *   current owner as `requested_by`);
+ *   current owner as requester);
  * - cancel → guard records `cancelled`, `session.abort()`.
  *
- * Identity: each message's `InvocationContext` carries the sender's Auth0 JWT. The runner keeps the
- * latest token per principal, and every tool call of a run uses its **owner's** token (a queued
- * follow-up runs with its sender's token; an approved call with the requester's). Tokens are never
- * audited, rendered or shown to the model.
+ * Identity: each message's `InvocationContext` carries the sender's resolved `Caller` (org user
+ * id, email, names) and Auth0 JWT. The runner keeps the latest of both per principal, and every
+ * tool call of a run uses its **owner's** (a queued follow-up runs as its sender; an approved call
+ * as the requester, never the approver): the token goes to the Gateway, the caller becomes the
+ * ticket's `requester_*` and the `requester` shown to approvers. Tokens are never audited,
+ * rendered or shown to the model; name and email never reach audit events.
+ *
+ * The model is told the first name of whom it is assisting (`firstPromptPreamble`) in the first
+ * user message of the thread and again whenever the speaker changes, never in the system prompt
+ * (the prompt cache stays shared across users).
  */
 
 import "./offline.ts"; // before pi runs: PI_OFFLINE & co.
@@ -31,15 +37,16 @@ import {
 import {
   acknowledged,
   type ApprovalDecision,
+  type Caller,
   type CallerToken,
   type AuditSink,
   type Clock,
   failed,
   finish,
+  firstPromptPreamble,
   type Incoming,
   type InvocationContext,
   mergeAnswers,
-  NO_INVOCATION_CONTEXT,
   nextFollowUp,
   type PrincipalId,
   receive,
@@ -133,6 +140,10 @@ export class SessionRunner {
   #pending: PendingApproval | null = null;
   /** The latest caller token seen per principal (the sender is the token's `sub`). */
   readonly #tokens = new Map<PrincipalId, CallerToken>();
+  /** Who each sender is (profile from their latest token); the run owner's caller is the requester. */
+  readonly #callers = new Map<PrincipalId, Caller>();
+  /** The speaker the model was last told it is assisting (pi's transcript is append-only). */
+  #introduced: PrincipalId | null = null;
 
   private constructor(options: SessionRunnerOptions, pi: AgentSession, slot: RunSlot, tools: readonly GenericTool[]) {
     this.#options = options;
@@ -194,7 +205,9 @@ export class SessionRunner {
     return this.#pi.getActiveToolNames();
   }
 
-  async handle(message: Incoming, context: InvocationContext = NO_INVOCATION_CONTEXT): Promise<Reply> {
+  async handle(message: Incoming, context: InvocationContext): Promise<Reply> {
+    if (context.caller.subject !== message.sender) throw new Error("caller does not match the message sender");
+    this.#callers.set(message.sender, context.caller);
     if (context.callerToken !== null) this.#tokens.set(message.sender, context.callerToken);
     const [state, action] = receive(this.#state, message, this.#options.settings.agent.busyPolicy);
     this.#state = state;
@@ -259,6 +272,7 @@ export class SessionRunner {
       guard,
       session,
       owner,
+      requester: () => this.#callers.get(owner) ?? null,
       callerToken: () => this.#tokens.get(owner) ?? null,
       pendingApproval: null,
       firstTurnChecked: false,
@@ -285,7 +299,7 @@ export class SessionRunner {
     }
     guard.finish();
 
-    const [state, reply] = finish(this.#state, outcome, owner, settings.approvals);
+    const [state, reply] = finish(this.#state, outcome, owner, settings.approvals, run.requester());
     this.#state = state;
     if (outcome.kind === "approval_needed") this.#pending = run.pendingApproval;
     return reply;
@@ -300,8 +314,9 @@ export class SessionRunner {
     if (decision.kind === "stop") return stopped(decision, "");
     run.firstTurnChecked = true;
 
+    const text = prompt.fromUser ? this.#introduce(run, prompt.text) : prompt.text;
     const before = this.#pi.messages.length;
-    await this.#pi.prompt(prompt.text, { expandPromptTemplates: false });
+    await this.#pi.prompt(text, { expandPromptTemplates: false });
     const final = parseFinalMessage(this.#pi.messages.slice(before));
     if (final.kind === "err") throw final.error;
 
@@ -318,20 +333,38 @@ export class SessionRunner {
     return outcome;
   }
 
+  /**
+   * Prefix a user's prompt with who the model is assisting when the speaker changed (the first
+   * prompt of the thread, or a follow-up from someone else). Only called when the prompt is
+   * handed to pi, so a run stopped before the model never "introduces" anyone.
+   */
+  #introduce(run: ActiveRun, text: string): string {
+    const caller = run.requester();
+    if (caller === null || this.#introduced === caller.subject) return text;
+    this.#introduced = caller.subject;
+    const preamble = firstPromptPreamble(caller);
+    return preamble === null ? text : `${preamble}\n\n${text}`;
+  }
+
   /** The text pi receives; for an approval, the approved call is executed first (exactly once). */
   async #promptFor(
     input: RunInput,
     run: ActiveRun,
-  ): Promise<{ readonly kind: "prompt"; readonly text: string } | { readonly kind: "stopped"; readonly outcome: RunOutcome }> {
+  ): Promise<
+    | { readonly kind: "prompt"; readonly text: string; readonly fromUser: boolean }
+    | { readonly kind: "stopped"; readonly outcome: RunOutcome }
+  > {
     switch (input.kind) {
       case "prompt":
-        return { kind: "prompt", text: input.text };
+        return { kind: "prompt", text: input.text, fromUser: true };
       case "approval": {
         const { pending, approver } = input;
-        if (input.decision === "reject") return { kind: "prompt", text: approvalRejectedPrompt(pending, approver) };
+        if (input.decision === "reject") {
+          return { kind: "prompt", text: approvalRejectedPrompt(pending, approver), fromUser: false };
+        }
         const executed = await this.#executeApproved(pending, run);
         if (executed.kind === "stopped") return executed;
-        return { kind: "prompt", text: approvalGrantedPrompt(pending, approver, executed.outcome) };
+        return { kind: "prompt", text: approvalGrantedPrompt(pending, approver, executed.outcome), fromUser: false };
       }
       default:
         return assertNever(input);
@@ -356,7 +389,7 @@ export class SessionRunner {
         if (tool === undefined) return { kind: "executed", outcome: { kind: "error", text: `unknown tool ${pending.tool}` } };
         const outcome = await invokeTool(this.#options.caller, tool, pending.arguments, {
           session: run.session,
-          principal: run.owner,
+          requester: run.requester(),
           callerToken: run.callerToken(),
         });
         return { kind: "executed", outcome };

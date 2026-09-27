@@ -13,8 +13,8 @@
  *     wall clock, kill switch). Throwing aborts the model call.
  *   - `tool.execute.before`: runs before the permission check and the execution of every tool →
  *     RunGuard.beforeToolCall (allowlist, tool-call cap, loop detection). Throwing blocks the tool
- *     (the model sees the error). For side-effecting tools the adapter returns `requested_by` and
- *     `idempotency_key`, which are written INTO `output.args` (the same object opencode then passes
+ *     (the model sees the error). For side-effecting tools the adapter returns `requester_id`,
+ *     `requester_name`, `requester_email` and `idempotency_key`, which are written INTO `output.args` (the same object opencode then passes
  *     to the MCP call, so the model cannot choose them).
  *   - `tool.execute.after`: redacts tool output before it reaches the model and the session DB.
  *   - `shell.env`: removes AWS credentials from any shell environment (bash is denied anyway).

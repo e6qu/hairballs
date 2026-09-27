@@ -8,6 +8,7 @@
 export * from "./result.ts";
 export * from "./parsing.ts";
 export * from "./domain.ts";
+export * from "./identity.ts";
 
 export * from "./core/pricing.ts";
 export * from "./core/guard.ts";
@@ -38,7 +39,8 @@ export {
 export * from "./shell/runGuard.ts";
 export * from "./shell/config.ts";
 export * from "./shell/settings.ts";
+export * from "./shell/identity.ts";
 export * from "./shell/invocation.ts";
-export { render as renderReply } from "./shell/replies.ts";
+export { render as renderReply, renderCaller } from "./shell/replies.ts";
 export * from "./shell/mcpClient.ts";
 export * from "./shell/agentcoreServer.ts";

@@ -237,6 +237,7 @@ test("replies render to the same JSON as Python", () => {
       tool: ToolName.of("create_ticket"),
       reason: "needs approval",
       approvers: new Set([PrincipalId.of("zed"), PrincipalId.of("auth0|lead")]),
+      requester: null,
     }),
     {
       status: "approval_required",

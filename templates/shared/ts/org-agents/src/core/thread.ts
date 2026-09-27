@@ -4,6 +4,7 @@
  */
 
 import type { MessageId, PrincipalId, Prompt } from "../domain.ts";
+import type { Caller } from "../identity.ts";
 import { assertNever } from "../result.ts";
 import { type ApprovalPolicy, approversFor, type Reply, type RunOutcome } from "./conversation.ts";
 import {
@@ -66,6 +67,8 @@ export function finish(
   outcome: RunOutcome,
   owner: PrincipalId,
   approvals: ApprovalPolicy,
+  /** The run owner as a caller: shown to approvers in an approval request. */
+  requester: Caller | null = null,
 ): readonly [ThreadState, Reply] {
   switch (outcome.kind) {
     case "completed":
@@ -80,6 +83,7 @@ export function finish(
           tool: outcome.tool,
           reason: outcome.reason,
           approvers,
+          requester,
         },
       ];
     }

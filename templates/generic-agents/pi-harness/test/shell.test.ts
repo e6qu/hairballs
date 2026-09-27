@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import { ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { FakeClock, Instant, loadSettings, ok, PrincipalId, ToolName, unwrap, Usage, TokenCount } from "@org/agents";
+import { FakeClock, Instant, loadSettings, ok, PrincipalId, serviceClient, ToolName, unwrap, Usage, TokenCount } from "@org/agents";
 
 import { refreshEnabled, startCredentialRefresh } from "../src/shell/credentials.ts";
 import { withGuardrail } from "../src/shell/guardrail.ts";
@@ -12,7 +12,7 @@ import { BEDROCK_PROVIDER, bedrockModel, loadPiModelSettings, parsePiModelSettin
 import { piAi } from "../src/shell/piAi.ts";
 import { parseAssistantUsage, parseCompactionUsage, parseFinalMessage } from "../src/shell/piMessages.ts";
 import { genericTools, invokeTool, mcpArguments, type ToolCaller } from "../src/shell/tools.ts";
-import { ALICE, ROOT, SESSION } from "./support.ts";
+import { ALICE, BOB, CALLERS, ROOT, SESSION } from "./support.ts";
 
 const tool = (name: string) => {
   const found = genericTools(piAi.Type).find((t) => t.name === name);
@@ -47,18 +47,48 @@ describe("pi message parsing", () => {
 });
 
 describe("tool arguments", () => {
-  const identity = { session: SESSION, principal: ALICE, callerToken: null };
+  const identity = { session: SESSION, requester: CALLERS.get(ALICE) ?? null, callerToken: null };
 
-  test("create_ticket: the harness sets requested_by and the idempotency key, not the model", () => {
-    const args = unwrap(
-      mcpArguments(tool("create_ticket"), { title: "VPN", description: "down", requested_by: "mallory", idempotency_key: "x" }, identity),
+  test("create_ticket: the harness sets the requester and the idempotency key, not the model", () => {
+    const forged = {
+      title: "VPN",
+      description: "down",
+      requester_id: "usr_mallory",
+      requester_name: "Mallory",
+      requester_email: "mallory@evil.example",
+      requested_by: "mallory",
+      idempotency_key: "x",
+    };
+    const args = unwrap(mcpArguments(tool("create_ticket"), forged, identity));
+    assert.deepEqual(
+      { ...args, idempotency_key: undefined },
+      {
+        title: "VPN",
+        description: "down",
+        requester_id: "usr_alice",
+        requester_name: "Alice",
+        requester_email: "alice@example.com",
+        idempotency_key: undefined,
+      },
     );
-    assert.equal(args["requested_by"], "auth0|alice");
     assert.match(String(args["idempotency_key"]), /^idem-[0-9a-f]{32}$/);
     const again = unwrap(mcpArguments(tool("create_ticket"), { description: "down", title: "VPN" }, identity));
-    assert.equal(again["idempotency_key"], args["idempotency_key"]); // same call → same key
-    const other = unwrap(mcpArguments(tool("create_ticket"), { title: "VPN", description: "down" }, { ...identity, principal: PrincipalId.of("auth0|bob") }));
+    assert.equal(again["idempotency_key"], args["idempotency_key"]); // same call → same key (forged fields ignored)
+    const other = unwrap(mcpArguments(tool("create_ticket"), { title: "VPN", description: "down" }, { ...identity, requester: CALLERS.get(BOB) ?? null }));
     assert.equal(other["idempotency_key"], args["idempotency_key"]); // keyed by session + arguments
+    assert.equal(other["requester_id"], "usr_bob");
+  });
+
+  test("create_ticket: a service caller has no email; an unknown requester fails the call", () => {
+    const service = { ...identity, requester: serviceClient(PrincipalId.of("m2m@clients")) };
+    const args = unwrap(mcpArguments(tool("create_ticket"), { title: "VPN", description: "down", requester_email: "x@y.io" }, service));
+    assert.equal(args["requester_id"], "m2m@clients");
+    assert.equal(args["requester_name"], "service m2m@clients");
+    assert.equal(args["requester_email"], "");
+    const unknown = mcpArguments(tool("create_ticket"), { title: "VPN", description: "down" }, { ...identity, requester: null });
+    assert.equal(unknown.kind === "err" && unknown.error.path, "$.requester");
+    // Read-only tools do not need a requester.
+    assert.equal(mcpArguments(tool("calculate"), { expression: "1" }, { ...identity, requester: null }).kind, "ok");
   });
 
   test("read-only tools get only their declared fields", () => {

@@ -12,8 +12,9 @@ through the category **MCP server** ([`../tools`](../tools), `generic_tools.shel
 locally on `http://127.0.0.1:8000/mcp`, in production the **AgentCore Gateway** URL (`TOOLS_MCP_URL`).
 
 **Tools:** `calculate`, `search_knowledge`, `get_ticket`, and `create_ticket` (side-effecting:
-**human approval, four-eyes**, **idempotent**; `requested_by` and `idempotency_key` are set by the
-harness, never by the model).
+**human approval, four-eyes**, **idempotent**; `requester_id`, `requester_name`, `requester_email`
+and `idempotency_key` are set by the harness from the run owner's resolved identity, never by the
+model).
 
 ## Behaviour
 
@@ -22,7 +23,7 @@ harness, never by the model).
 | Limits | Turns, total tokens, **USD budget**, wall clock, tool calls, loop detection (identical call ×3), kill switch: `@org/agents` `RunGuard`, wired through the org pi extension: `turn_start` → `beforeModelCall` (→ `ctx.abort()`), `message_end` usage `{input, output, cacheRead, cacheWrite}` → `afterModelCall`, `tool_call` → `beforeToolCall` (→ `{block, reason, terminate}`), `session_compact` usage → `recordExternalUsage`. The runner asks the guard once more *before* `session.prompt()`, so a kill switch or spent budget never reaches the provider. A timer aborts a hung call at the wall-clock limit |
 | Tool policy | Allowlist + approval globs in `config/agent.toml`. pi's built-in tools are disabled (`noTools: "builtin"` + `excludeTools`); a tool the model invents is not registered, so pi answers "Tool … not found" |
 | Fail-safe | A throwing `tool_call` handler makes pi block the call; the handler throws when no guarded run is active. `agent_start` without an active run aborts |
-| Approval | The `tool_call` hook **holds** the call: it blocks it with a "pending approval" result and `terminate: true`, so the turn ends without another model call; the reply is `approval_required` with the approvers. On `{"approval": {"id", "decision": "approve"}}` from an authorised approver, the runner executes **that exact call** (same arguments) through the MCP client with `requested_by` = requester and the idempotency key, then gives the result to the agent as a new prompt (a new, auditable turn). `reject` → the agent is told it was not executed. The requester cannot self-approve unless `self_approval = true` |
+| Approval | The `tool_call` hook **holds** the call: it blocks it with a "pending approval" result and `terminate: true`, so the turn ends without another model call; the reply is `approval_required` with the approvers and the `requester` (`{kind, user_id, name, email}`). On `{"approval": {"id", "decision": "approve"}}` from an authorised approver, the runner executes **that exact call** (same arguments) through the MCP client with the requester (the run owner, never the approver) and the idempotency key, then gives the result to the agent as a new prompt (a new, auditable turn). `reject` → the agent is told it was not executed. The requester cannot self-approve unless `self_approval = true` |
 | Messages mid-run | Pure thread state machine (`@org/agents` `core/thread`): the run owner **steers** (`session.steer()`: pi injects it after the current tool batch, before the next model call); other users are **queued** and run afterwards as their own run (not pi's `followUp()`, which would run inside the current run's budget and identity); duplicates are ignored; cancel → guard records `cancelled` + `session.abort()` |
 | Failures | A provider/model error (`stopReason: "error"`) → `{"status": "failed"}` (redacted, truncated); the thread returns to idle and the next message starts a new run. A Bedrock **guardrail intervention** → `stopped` (policy stop), not `failed` |
 | Guardrails | Only if `GUARDRAIL_ID` (+ `GUARDRAIL_VERSION`) is set: `before_provider_request` adds `guardrailConfig` to the Converse request. **Fails open** (pi sends the request unchanged if the handler throws), so also enforce it in IAM |
@@ -30,7 +31,9 @@ harness, never by the model).
 | Caching | pi adds Bedrock `cachePoint`s when the model **name** contains the family (`[pi] model_family`, since inference-profile ARNs don't match). Stable system prompt, fixed tool list, append-only history |
 | Supply chain | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` forced in `src/shell/offline.ts` (and the Dockerfile); no extension/skill/prompt/theme/context-file discovery; in-memory settings, session and credential store (nothing read from `~/.pi`) |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
-| Identity | The caller's Auth0 JWT (validated by the runtime's `customJWTAuthorizer`) → `sub` is the principal; pi's `ctx` has no request identity, so the runner publishes the active run (owner, guard, owner's token) to the extension (`RunSlot`) |
+| Identity | The caller's Auth0 JWT (validated by the runtime's `customJWTAuthorizer`) → `sub` is the principal. `@org/agents`' `IdentityResolver` (claim namespace from `[identity].claim_namespace`) turns the token's claims into a `Caller`: org user id (from `<ns>user_id`, else minted once per `sub` and remembered, so email/name changes keep it), required email, optional names; services (`…@clients`) have no profile. A human token without an email is `invalid_request`; no token → the local dev user unless `REQUIRE_TOKEN=true`. The directory is in-memory (per microVM): use the `user_id` claim or a shared `UserDirectory` in production. pi's `ctx` has no request identity, so the runner publishes the active run (owner, owner's caller, guard, owner's token) to the extension (`RunSlot`) |
+| Requester | The run owner's `Caller` becomes `create_ticket`'s `requester_id` (user id, or client `sub` for services), `requester_name`, `requester_email` (model-supplied values are dropped) and the `requester` of approval replies. A queued follow-up runs as its sender; an approved call as the requester. Name and email are PII: never in audit events |
+| Model context | The first name (`[Context: you are assisting Alice.]`, `firstPromptPreamble`) prefixes the first user message of the thread and the first prompt after the speaker changes; never the system prompt (the prompt cache stays shared across users) |
 | Gateway identity | The handler's `InvocationContext` (`@org/agents`) gives the raw JWT (`Authorization` must be in `requestHeaderAllowlist`). The runner keeps the latest token per principal and every MCP `tools/call` of a run carries its **owner's** token as `Authorization: Bearer …` (`McpToolGateway`: one `McpClient`/MCP session per token, the 16 most recent kept). A queued follow-up runs with its sender's token; an approved call runs with the requester's token (not the approver's). Tokens are never audited, rendered, logged or shown to the model |
 
 ## How AGENT_PI_BEDROCK.md maps to code
@@ -64,7 +67,7 @@ src/shell/
 ├── offline.ts            # PI_OFFLINE & co. (imported first)
 ├── piAi.ts               # pi's own copy of pi-ai (TypeBox, faux) / smithy IMDS
 ├── piMessages.ts         # pi messages (untyped) → Usage / FinalMessage
-├── tools.ts              # TypeBox schemas + MCP tools/call (requested_by, idempotency key, caller token)
+├── tools.ts              # TypeBox schemas + MCP tools/call (requester_*, idempotency key, caller token)
 ├── orgExtension.ts       # the org pi extension: RunGuard hooks, approval hold, redaction, tools
 ├── guardrail.ts          # before_provider_request → guardrailConfig
 ├── model.ts              # ModelRuntime + Bedrock inference profile; [pi] settings
@@ -94,7 +97,11 @@ HTTP boundary, built-in tools off. `test/identity.test.ts` uses an in-process fa
 that records headers: the owner's JWT reaches the Gateway per run (Alice's run with Alice's token,
 Bob's queued follow-up with Bob's, an approved call with the requester's, and over HTTP from the
 `/invocations` `Authorization` header), and no token appears in replies, audit events, the
-model's context or console output.
+model's context or console output. It also checks the requester: `create_ticket` gets the run
+owner's `requester_*` (forged model values dropped, not the approver's; a queued follow-up's is its
+sender's), approval replies show the requester, no name/email in audit events, the first-name
+preamble once per speaker and never in the system prompt, and over HTTP the caller from the
+token's claims (user id kept across an email change, missing email → `invalid_request`).
 
 Locally against Bedrock (AWS credentials with `bedrock:InvokeModel*` on the model) and the tools server:
 

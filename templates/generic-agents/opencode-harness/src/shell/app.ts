@@ -21,9 +21,9 @@ import {
   type InvocationContext,
   type InvocationHandler,
   JsonLinesAuditSink,
+  identityResolverFrom,
   killSwitchFrom,
   loadSettings,
-  NO_INVOCATION_CONTEXT,
   type PrincipalId,
   refused,
   type Reply,
@@ -76,6 +76,10 @@ export class Registry {
     this.#o = options;
   }
 
+  get settings(): Settings {
+    return this.#o.settings;
+  }
+
   get host(): OpencodeHost | null {
     return this.#host;
   }
@@ -103,7 +107,8 @@ export class Registry {
     return runner;
   }
 
-  async handle(session: SessionId, incoming: Incoming, context: InvocationContext = NO_INVOCATION_CONTEXT): Promise<Reply> {
+  /** `context.caller` is the sender's resolved identity (the AgentCore server's `IdentityResolver`). */
+  async handle(session: SessionId, incoming: Incoming, context: InvocationContext): Promise<Reply> {
     const decision = toolIdentity(this.#bound, incoming);
     switch (decision.kind) {
       case "refuse":
@@ -119,7 +124,7 @@ export class Registry {
     }
     // A cancel or approval before any prompt: nothing can be running or pending yet.
     if (this.#host === null) return refused(NOTHING_ASKED_REASON);
-    return this.runner(session, this.#host).handle(incoming);
+    return this.runner(session, this.#host).handle(incoming, context.caller);
   }
 
   async stop(): Promise<void> {
@@ -166,7 +171,9 @@ export function productionRegistry(env: Env): Registry {
 
 async function main(): Promise<void> {
   const registry = productionRegistry(process.env);
-  const server = await startAgentCoreServer({ handler: invocationHandler(registry) });
+  // Requests without a token act as LOCAL_USER (local runs); REQUIRE_TOKEN=true refuses them.
+  const identity = identityResolverFrom(registry.settings.identity, process.env);
+  const server = await startAgentCoreServer({ handler: invocationHandler(registry), identity });
   console.error(`generic opencode agent listening on ${server.url}`);
   const shutdown = (): void => {
     void server

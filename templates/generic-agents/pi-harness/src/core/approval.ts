@@ -5,7 +5,7 @@
  *   1. the guard extension blocks the tool call with a "pending approval" result and ends the
  *      turn (`terminate: true`); the run ends with `approval_needed`;
  *   2. on approval the shell executes *that exact call* (same arguments) through the MCP client,
- *      with the harness-set `requested_by` and idempotency key, and hands the result back to the
+ *      with the harness-set requester (the run owner) and idempotency key, and hands the result back to the
  *      agent as a new, auditable prompt; on rejection it tells the agent the action was not done.
  */
 

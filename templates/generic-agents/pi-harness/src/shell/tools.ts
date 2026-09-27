@@ -7,7 +7,8 @@
  *
  * The TypeBox parameter schemas are framework schema (what pi shows the model and validates); they
  * live only here. Arguments are forwarded as untyped data and parsed by the tools service. For
- * `create_ticket` the harness (never the model) sets `requested_by` and `idempotency_key`.
+ * `create_ticket` the harness (never the model) sets `requester_id`, `requester_name`,
+ * `requester_email` (from the run owner's resolved `Caller`) and `idempotency_key`.
  *
  * Every call carries the run owner's Auth0 JWT (`CallerToken`) as `Authorization: Bearer …`, so
  * AgentCore Gateway (and its Cedar policy) sees the user, not the agent. `McpToolGateway` keeps
@@ -15,16 +16,19 @@
  */
 
 import {
+  assertNever,
+  type Caller,
   type CallerToken,
   describeMcpError,
+  displayName,
   expectObject,
+  fail,
   fingerprintArguments,
   idempotencyKey,
   McpClient,
   type McpCallResult,
   type McpError,
   type Parsed,
-  type PrincipalId,
   type Result,
   type SessionId,
   ToolName,
@@ -42,7 +46,7 @@ export type GenericTool = {
   readonly parameters: TSchema;
   /** Fields the model may set; anything else in the model's arguments is dropped. */
   readonly argumentNames: readonly string[];
-  /** The harness adds `requested_by` (the run's principal) and `idempotency_key`. */
+  /** The harness adds the requester (the run owner) and `idempotency_key`; the model cannot set them. */
   readonly harnessIdentity: boolean;
 };
 
@@ -54,12 +58,29 @@ export type ToolCaller = {
   callTool(name: ToolName, args: unknown, token: CallerToken | null): Promise<Result<McpCallResult, McpError>>;
 };
 
-/** Who a call is made for: the run owner (and their token), in this session. */
+/** Who a call is made for: the run owner (their resolved caller and token), in this session. */
 export type CallIdentity = {
   readonly session: SessionId;
-  readonly principal: PrincipalId;
+  /** The run owner; `null` if unknown, which fails side-effecting calls. */
+  readonly requester: Caller | null;
   readonly callerToken: CallerToken | null;
 };
+
+/**
+ * The generic tools' requester fields (PII: name and email go to the ticket, never to audit
+ * events). `requester_id` is the org user id for people (stable across email and name changes)
+ * or the client `sub` for services, which have no email (empty string).
+ */
+export function requesterArguments(caller: Caller): Readonly<Record<string, string>> {
+  switch (caller.kind) {
+    case "human":
+      return { requester_id: caller.userId, requester_name: displayName(caller), requester_email: caller.email };
+    case "service":
+      return { requester_id: caller.subject, requester_name: displayName(caller), requester_email: "" };
+    default:
+      return assertNever(caller);
+  }
+}
 
 /**
  * The production `ToolCaller`: the tools MCP server / AgentCore Gateway, one `McpClient` per
@@ -152,8 +173,9 @@ export function genericTools(Type: PiAi["Type"]): readonly GenericTool[] {
 }
 
 /**
- * The `tools/call` arguments: the model's fields the tool declares, plus (for side-effecting
- * tools) the principal and an idempotency key derived from the session and those fields.
+ * The `tools/call` arguments: the model's fields the tool declares (anything else, including a
+ * model-supplied `requester_*`, is dropped), plus (for side-effecting tools) the run owner as
+ * requester and an idempotency key derived from the session and the model's fields.
  */
 export function mcpArguments(tool: GenericTool, modelArguments: unknown, identity: CallIdentity): Parsed<Record<string, unknown>> {
   const fields = expectObject(modelArguments, "$.arguments");
@@ -163,8 +185,9 @@ export function mcpArguments(tool: GenericTool, modelArguments: unknown, identit
     if (Object.hasOwn(fields.value, name)) picked[name] = fields.value[name];
   }
   if (!tool.harnessIdentity) return { kind: "ok", value: picked };
+  if (identity.requester === null) return fail("$.requester", "the requester is unknown; the call was not made");
   const key = idempotencyKey(identity.session, tool.name, fingerprintArguments(picked));
-  return { kind: "ok", value: { ...picked, requested_by: identity.principal, idempotency_key: key } };
+  return { kind: "ok", value: { ...picked, ...requesterArguments(identity.requester), idempotency_key: key } };
 }
 
 export async function invokeTool(

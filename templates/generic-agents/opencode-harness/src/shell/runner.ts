@@ -8,12 +8,18 @@
  *
  *   plugin chat.params          → beforeModelCall()    (turns, tokens, USD, wall clock, kill switch)
  *   plugin tool.execute.before  → beforeToolCall()     (allowlist, tool-call cap, loop detection,
- *                                                       requested_by + idempotency key injection)
+ *                                                       requester_* + idempotency key injection)
  *   event message.updated       → afterModelCall()     (tokens → org pricing; opencode's own cost
  *                                                       estimate is ignored)
  *   event permission.asked      → approval routing (four-eyes) / reject / doom loop → stop
  *   adapter timer               → wall clock stop
  *   any stop                    → POST /session/:id/abort
+ *
+ * Identity: `handle` gets each message's resolved `Caller` (org user id, email, names). A run's
+ * owner is its requester: the `requester_*` of side-effecting tools and the `requester` shown to
+ * approvers (an approved call stays the owner's, never the approver's). The model is told the
+ * owner's first name (`firstPromptPreamble`) in the first user message of the opencode session and
+ * whenever the speaker changes, never in the system prompt (the prompt cache stays shared).
  */
 
 import {
@@ -22,11 +28,13 @@ import {
   approvalNeeded,
   type ApprovalDecision,
   type AuditSink,
+  type Caller,
   type Clock,
   completed,
   failed,
   finish,
   fingerprintArguments,
+  firstPromptPreamble,
   type Incoming,
   mergeAnswers,
   nextFollowUp,
@@ -48,7 +56,14 @@ import {
 } from "@org/agents";
 
 import { OcSessionId, type OcMessageId, type PermissionRequestId } from "../domain.ts";
-import { decideAsk, type McpServerName, orgToolName, permissionRules, sideEffectArguments } from "../core/permissions.ts";
+import {
+  decideAsk,
+  type McpServerName,
+  modelArguments,
+  orgToolName,
+  permissionRules,
+  sideEffectArguments,
+} from "../core/permissions.ts";
 import type { GuardTarget, ModelVerdict, ToolVerdictForPlugin } from "./guardBridge.ts";
 import type { OpencodeHost } from "./opencodeHost.ts";
 import { isAbortError, type OcEvent, parseAssistantMessages } from "./opencodeEvents.ts";
@@ -78,6 +93,8 @@ type PendingApproval = { readonly request: PermissionRequestId; readonly approva
 class ActiveRun {
   guard: RunGuard;
   readonly owner: PrincipalId;
+  /** The owner's resolved caller: the requester of side-effecting tools. */
+  readonly requester: Caller;
   readonly messages: OcMessageId[] = [];
   error: string | null = null;
   pending: PendingApproval | null = null;
@@ -87,9 +104,10 @@ class ActiveRun {
   readonly #signals: Signal[] = [];
   #waiter: ((signal: Signal) => void) | null = null;
 
-  constructor(guard: RunGuard, owner: PrincipalId) {
+  constructor(guard: RunGuard, requester: Caller) {
     this.guard = guard;
-    this.owner = owner;
+    this.owner = requester.subject;
+    this.requester = requester;
   }
 
   signal(signal: Signal): void {
@@ -116,6 +134,10 @@ export class SessionRunner implements GuardTarget {
   #run: ActiveRun | null = null;
   /** Assistant messages whose usage has been reported to a guard (opencode may repeat updates). */
   readonly #accounted = new Set<OcMessageId>();
+  /** Who each sender is (profile from their latest token). */
+  readonly #callers = new Map<PrincipalId, Caller>();
+  /** The speaker the model was last told it is assisting (opencode's transcript is append-only). */
+  #introduced: PrincipalId | null = null;
 
   constructor(options: RunnerOptions) {
     this.#o = options;
@@ -131,7 +153,10 @@ export class SessionRunner implements GuardTarget {
 
   // ------------------------------------------------------------------ messages from the caller
 
-  async handle(message: Incoming): Promise<Reply> {
+  /** `caller` is the message sender's resolved identity (`caller.subject === message.sender`). */
+  async handle(message: Incoming, caller: Caller): Promise<Reply> {
+    if (caller.subject !== message.sender) throw new Error("caller does not match the message sender");
+    this.#callers.set(message.sender, caller);
     const [state, action] = receive(this.#state, message, this.#o.settings.agent.busyPolicy);
     this.#state = state;
     switch (action.kind) {
@@ -190,7 +215,8 @@ export class SessionRunner implements GuardTarget {
   }
 
   #finish(outcome: RunOutcome, owner: PrincipalId): Reply {
-    const [state, reply] = finish(this.#state, outcome, owner, this.#o.settings.approvals);
+    const requester = this.#callers.get(owner) ?? null;
+    const [state, reply] = finish(this.#state, outcome, owner, this.#o.settings.approvals, requester);
     this.#state = state;
     return reply;
   }
@@ -211,6 +237,7 @@ export class SessionRunner implements GuardTarget {
     if (parsed.kind === "err") throw parsed.error;
     const oc = parsed.value;
     this.#oc = oc;
+    this.#introduced = null; // a new opencode session has a fresh transcript
     host.listen(oc, { onEvent: (event) => this.#onEvent(event), onLost: (error) => this.#run?.signal({ kind: "lost", error }) });
     host.bridge.register(oc, this);
     return oc;
@@ -244,12 +271,25 @@ export class SessionRunner implements GuardTarget {
   // ------------------------------------------------------------------ runs
 
   async #start(prompt: Prompt, owner: PrincipalId): Promise<RunOutcome> {
+    const requester = this.#callers.get(owner);
+    if (requester === undefined) throw new Error("the run owner is unknown");
     const oc = await this.#session();
-    const run = new ActiveRun(this.#newGuard(), owner);
+    const run = new ActiveRun(this.#newGuard(), requester);
     this.#run = run;
     this.#armWallClock(run);
-    await this.#o.host.api.promptAsync(oc, this.#o.agent, prompt);
+    await this.#o.host.api.promptAsync(oc, this.#o.agent, this.#introduce(requester, prompt));
     return this.#await(run, oc);
+  }
+
+  /**
+   * Prefix a prompt with who the model is assisting when the speaker changed (the first prompt of
+   * the thread, or a follow-up from someone else). Never in the system prompt.
+   */
+  #introduce(caller: Caller, prompt: Prompt): string {
+    if (this.#introduced === caller.subject) return prompt;
+    this.#introduced = caller.subject;
+    const preamble = firstPromptPreamble(caller);
+    return preamble === null ? prompt : `${preamble}\n\n${prompt}`;
   }
 
   async #resume(approvalId: ApprovalId, decision: ApprovalDecision): Promise<RunOutcome> {
@@ -455,7 +495,7 @@ export class SessionRunner implements GuardTarget {
         // the request to the approvers. The guard, not the model, sets these arguments.
         return {
           kind: "proceed",
-          set: sideEffectArguments(this.#o.session, tool, fingerprintArguments(args), run.owner),
+          set: sideEffectArguments(this.#o.session, tool, fingerprintArguments(modelArguments(args)), run.requester),
         };
       case "block_tool":
         return { kind: "block", reason: verdict.reason };

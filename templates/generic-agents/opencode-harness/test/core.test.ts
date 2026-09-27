@@ -8,12 +8,16 @@ import {
   ApprovalId,
   cancelRequest,
   chatMessage,
+  EmailAddress,
   fingerprintArguments,
+  humanUser,
   MessageId,
   Prompt,
   PrincipalId,
+  serviceClient,
   SessionId,
   ToolName,
+  UserId,
   ToolPattern,
   type ToolPolicy,
 } from "@org/agents";
@@ -23,6 +27,7 @@ import {
   decideAsk,
   McpServerName,
   mcpToolKey,
+  modelArguments,
   orgToolName,
   type PermissionRule,
   permissionRules,
@@ -104,17 +109,39 @@ describe("tool names and permission requests", () => {
     assert.equal(decideAsk("doom_loop", ORG, TOOLS_SERVER).kind, "reject_loop");
   });
 
-  test("side-effect arguments: principal from the guard, idempotency key from session + canonical args", () => {
+  test("side-effect arguments: requester from the guard, idempotency key from session + canonical args", () => {
     const session = SessionId.of("thread-1");
     const tool = ToolName.of("create_ticket");
-    const alice = PrincipalId.of("auth0|alice");
+    const alice = humanUser({
+      userId: UserId.of("usr_alice"),
+      subject: PrincipalId.of("auth0|alice"),
+      email: EmailAddress.of("alice@example.com"),
+      givenName: null,
+      familyName: null,
+    });
     const a = sideEffectArguments(session, tool, fingerprintArguments({ title: "x", description: "y" }), alice);
     const b = sideEffectArguments(session, tool, fingerprintArguments({ description: "y", title: "x" }), alice);
     const other = sideEffectArguments(SessionId.of("thread-2"), tool, fingerprintArguments({ title: "x", description: "y" }), alice);
-    assert.equal(a["requested_by"], "auth0|alice");
+    assert.deepEqual({ ...a, idempotency_key: undefined }, {
+      requester_id: "usr_alice",
+      requester_name: "alice@example.com", // no name: the email address is the display name
+      requester_email: "alice@example.com",
+      idempotency_key: undefined,
+    });
     assert.match(a["idempotency_key"] ?? "", /^idem-[0-9a-f]{32}$/);
     assert.equal(a["idempotency_key"], b["idempotency_key"]);
     assert.notEqual(a["idempotency_key"], other["idempotency_key"]);
+    const service = sideEffectArguments(session, tool, fingerprintArguments({}), serviceClient(PrincipalId.of("m2m@clients")));
+    assert.equal(service["requester_id"], "m2m@clients");
+    assert.equal(service["requester_name"], "service m2m@clients");
+    assert.equal(service["requester_email"], "");
+  });
+
+  test("harness fields the model tried to set do not change the idempotency key", () => {
+    const forged = { title: "x", description: "y", requester_id: "usr_mallory", requester_email: "m@evil.example", idempotency_key: "k" };
+    assert.deepEqual(modelArguments(forged), { title: "x", description: "y" });
+    assert.equal(fingerprintArguments(modelArguments(forged)), fingerprintArguments({ description: "y", title: "x" }));
+    assert.equal(modelArguments("not an object"), "not an object");
   });
 });
 

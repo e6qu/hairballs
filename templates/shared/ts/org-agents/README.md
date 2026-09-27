@@ -21,7 +21,7 @@ What every agent gets from it (see `templates/CODING_STANDARDS.md` §6):
   idempotency keys and redaction (JWTs, AWS keys, e-mail, IBAN with mod-97, cards with Luhn).
 - **Shell** (`src/shell/`): clocks, argument fingerprints, audit events + JSON-lines sink,
   `RunGuard` (what framework hooks call), config / settings loading with env overrides,
-  `/invocations` parsing + JWT principal, reply rendering, a minimal **MCP client** (Streamable
+  `/invocations` parsing, caller identity (JWT claims → `Caller`, user directory, resolver), reply rendering, a minimal **MCP client** (Streamable
   HTTP) and the **AgentCore Runtime HTTP server** (`GET /ping`, `POST /invocations`).
 
 ## Using it from a variant
@@ -67,16 +67,43 @@ JSON the Python variants return (`{"status": "completed", "answers": [...]}`, `a
 
 ### Caller identity (`InvocationContext`)
 
-The third handler argument carries the per-request credentials, parsed at the boundary into
-branded types (additive: `(session, incoming) => …` handlers still type-check and work):
+The third handler argument carries who is calling and the per-request credentials, parsed at the
+boundary into domain types (additive: `(session, incoming) => …` handlers still type-check and work):
 
 ```ts
 type InvocationContext = {
+  readonly caller: Caller;                                  // HumanUser | ServiceClient; caller.subject === incoming.sender
   readonly callerToken: CallerToken | null;                 // Authorization: Bearer <jwt>
   readonly workloadAccessToken: WorkloadAccessToken | null; // WorkloadAccessToken / X-Amz-Bedrock-AgentCore-Identity-WAT
 };
-startAgentCoreServer({ handler: async (session, incoming, { callerToken }) => runner.handle(incoming, callerToken) });
+const identity = identityResolverFrom(settings.identity, process.env); // [identity].claim_namespace, REQUIRE_TOKEN
+startAgentCoreServer({ identity, handler: async (session, incoming, context) => runner.handle(incoming, context) });
 ```
+
+The caller (`src/identity.ts`, pure; `src/shell/identity.ts`, shell) is a port of Python's
+`org_agents.identity`:
+
+- `parseClaims(claims, names)`: `sub` ending in `@clients` or `gty = client-credentials` →
+  `ServiceClient` (no profile). Otherwise a person: **email required** (`<ns>email`, falling back to
+  `email`; missing → `invalid_request` at `$.jwt.<ns>email`), optional `<ns>given_name` /
+  `<ns>family_name` (fallbacks `given_name` / `family_name`), optional `<ns>user_id`. Namespace
+  from `[identity].claim_namespace` in `config/agent.toml` (default `https://fintech.example/`;
+  `Settings.identity`). `UserId`, `EmailAddress` (domain lower-cased), `PersonName` (whitespace
+  collapsed, no markup/control characters) are branded types.
+- `resolveCaller(claims, known, minted)`: the org user id is the claim, else the one remembered
+  for this `sub`, else a newly minted one (`usr_<uuid hex>`), so email and name changes keep the
+  id. `IdentityResolver` does that against a `UserDirectory` (async interface;
+  `InMemoryUserDirectory` here, no SQLite since this library does not use `node:sqlite`; use a
+  shared store such as DynamoDB keyed by `sub`, or the Auth0 `user_id` claim, in production). No
+  token → `LOCAL_USER` (`local-dev`), or `invalid_request` with `localUser: null` /
+  `REQUIRE_TOKEN=true`.
+- `finish(state, outcome, owner, approvals, requester)` puts the run owner's caller on
+  `ApprovalRequested.requester`; `renderReply` adds `"requester": {"kind": "user", "user_id",
+  "name", "email"}` (or `{"kind": "service", "client"}`) via `renderCaller`.
+- `firstPromptPreamble(caller)` → `[Context: you are assisting <given name>.]` for the first user
+  message of a speaker; never put it in the system prompt (prompt cache).
+- Name and email are PII: replies to approvers, tool arguments (ticket requester) and the model's
+  context only, **never audit events**.
 
 - `callerToken` is the raw Auth0 JWT, which AgentCore Runtime has **already validated**; it reaches
   the container only if `Authorization` is in `requestHeaderAllowlist` (see

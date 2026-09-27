@@ -199,7 +199,9 @@ describe("IMDS credential_process helper", () => {
   });
 });
 
-const JWT_ALICE = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ sub: "auth0|alice" })).toString("base64url")}.sig`;
+const testJwt = (claims: Record<string, unknown>): string =>
+  `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.sig`;
+const JWT_ALICE = testJwt({ sub: "auth0|alice", "https://fintech.example/email": "alice@example.com" });
 
 describe("/invocations boundary", () => {
   test("invalid payloads are rejected before any run (no opencode needed)", async () => {
@@ -233,6 +235,18 @@ describe("/invocations boundary", () => {
         });
         assert.deepEqual(await response.json(), { status: "refused", reason: NOTHING_ASKED_REASON });
       }
+      // A person's token without an email claim is rejected at the boundary (identity is required).
+      const noEmail = await fetch(`${url}/invocations`, {
+        method: "POST",
+        headers: { [SESSION_HEADER]: "thread-1-00000000000000000000000000", authorization: `Bearer ${testJwt({ sub: "auth0|x" })}` },
+        body: JSON.stringify({ prompt: "hi" }),
+      });
+      assert.deepEqual(await noEmail.json(), {
+        status: "invalid_request",
+        path: "$.jwt.https://fintech.example/email",
+        error: "is required for human users (add it in the Auth0 Action)",
+      });
+      assert.equal(registry.boundPrincipal, null); // nothing was bound
       assert.equal(registry.boundPrincipal, null);
       assert.deepEqual(await (await fetch(`${url}/ping`)).json(), { status: "Healthy" });
       assert.equal(registry.host, null);

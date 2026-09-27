@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { ApprovalPolicy } from "../core/conversation.ts";
+import { ClaimNames } from "../identity.ts";
 import { attempt, expectObject, fieldOr, must, type Parsed } from "../parsing.ts";
 import { type AgentConfig, type Env, parseAgentConfig, parseTomlText } from "./config.ts";
 
@@ -11,6 +12,8 @@ export type Settings = {
   readonly agent: AgentConfig;
   readonly approvals: ApprovalPolicy;
   readonly systemPrompt: string;
+  /** Where the caller's profile is in the token (`[identity].claim_namespace`). */
+  readonly identity: ClaimNames;
 };
 
 export function parseSettings(raw: unknown, env: Env, systemPrompt: string): Parsed<Settings> {
@@ -20,6 +23,7 @@ export function parseSettings(raw: unknown, env: Env, systemPrompt: string): Par
       agent: must(parseAgentConfig(raw, env)),
       approvals: must(ApprovalPolicy.parse(fieldOr(doc, "approvals", {}))),
       systemPrompt,
+      identity: must(ClaimNames.parse(fieldOr(doc, "identity", {}))),
     };
   });
 }
