@@ -1,42 +1,38 @@
-"""Lambda function behind the gateway. It implements one tool: check_claim.
+"""Lambda function behind the gateway, implementing the tool check_claim (the shell).
 
-Deploy with handler "expenses_tool.handler" (Python 3.13). No dependencies.
+Deploy domain.py, core.py and this file with handler "expenses_tool.handler" (Python 3.13). No dependencies.
 """
 
-from typing import Protocol, TypedDict
+from __future__ import annotations
 
-LIMITS_EUR = {
-    "hotel": {"major": 180, "standard": 120},
-    "meals": {"major": 60, "standard": 60},
-}
-
-
-class ClaimResult(TypedDict):
-    within_policy: bool
-    limit_eur: int
-
-
-class ClientContext(Protocol):
-    custom: dict[str, str]
+from core import check_claim
+from domain import (
+    OverLimit,
+    ParseError,
+    Verdict,
+    WithinPolicy,
+    parse_claim,
+    parse_invoked_tool,
+)
 
 
-class GatewayContext(Protocol):
-    client_context: ClientContext
-
-
-def check_claim(category: str, amount_eur: float, city_class: str = "standard") -> ClaimResult:
-    limit = LIMITS_EUR[category][city_class]
-    return {"within_policy": amount_eur <= limit, "limit_eur": limit}
-
-
-def handler(event: dict[str, str | float], context: GatewayContext) -> ClaimResult:
+def handler(event: object, context: object) -> dict[str, object]:
     # The gateway passes the tool arguments as the event, and the tool name
     # as "<target>___<tool>" in the client context.
-    tool = context.client_context.custom["bedrockAgentCoreToolName"].split("___")[-1]
-    if tool != "check_claim":
-        raise ValueError(f"unknown tool: {tool}")
-    return check_claim(
-        category=str(event["category"]),
-        amount_eur=float(event["amount_eur"]),
-        city_class=str(event.get("city_class", "standard")),
-    )
+    tool = parse_invoked_tool(context)
+    if tool.tool != "check_claim":
+        raise ParseError(f"unknown tool: {tool}")
+    return to_json(check_claim(parse_claim(event)))
+
+
+def to_json(verdict: Verdict) -> dict[str, object]:
+    """The tool result the model reads."""
+    match verdict:
+        case WithinPolicy(limit=limit):
+            return {"within_policy": True, "limit_eur": limit.to_json()}
+        case OverLimit(limit=limit, excess=excess):
+            return {
+                "within_policy": False,
+                "limit_eur": limit.to_json(),
+                "excess_eur": excess.to_json(),
+            }

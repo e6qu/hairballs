@@ -1,7 +1,7 @@
 [
   {
     "name": "check_claim",
-    "description": "Check whether an expense amount is within Fintech Ltd policy. Returns within_policy and limit_eur.",
+    "description": "Check whether an expense amount is within Fintech Ltd policy. Returns within_policy, limit_eur and, when over the limit, excess_eur.",
     "inputSchema": {
       "type": "object",
       "properties": {

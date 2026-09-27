@@ -1,4 +1,4 @@
-// Call the gateway's MCP endpoint directly: list its tools, then call one.
+// Call the gateway's MCP endpoint directly: list its tools, then check a claim (the shell).
 // The gateway uses AWS_IAM inbound auth, so every request is signed with your
 // AWS credentials (SigV4, service "bedrock-agentcore").
 // Usage: GATEWAY_URL=https://<id>.gateway.bedrock-agentcore.eu-west-1.amazonaws.com/mcp \
@@ -8,6 +8,20 @@ import { fromNodeProviderChain } from "@aws-sdk/credential-providers";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { SignatureV4 } from "@smithy/signature-v4";
+import { render } from "./core.ts";
+import {
+  type Claim,
+  type GatewayToolName,
+  type GatewayUrl,
+  ParseError,
+  eurToJson,
+  formatToolName,
+  parseClaim,
+  parseGatewayUrl,
+  parseVerdict,
+} from "./domain.ts";
+
+const CHECK_CLAIM: GatewayToolName = { target: "expenses", tool: "check_claim" };
 
 const signer = new SignatureV4({
   service: "bedrock-agentcore",
@@ -36,25 +50,51 @@ async function signedFetch(url: string | URL, init: RequestInit = {}): Promise<R
   return fetch(target, { ...init, headers });
 }
 
-async function main(gatewayUrl: string): Promise<void> {
+async function check(gateway: GatewayUrl, claim: Claim): Promise<void> {
   const client = new Client({ name: "helpdesk-app", version: "0.1.0" });
-  await client.connect(
-    new StreamableHTTPClientTransport(new URL(gatewayUrl), { fetch: signedFetch }),
-  );
+  await client.connect(new StreamableHTTPClientTransport(new URL(gateway), { fetch: signedFetch }));
+  try {
+    const { tools } = await client.listTools();
+    console.log(`tools: ${tools.map((t) => t.name).join(", ")}`);
 
-  const { tools } = await client.listTools();
-  for (const tool of tools) {
-    console.log(tool.name); // "<target>___<tool>", e.g. expenses___check_claim
+    const result = await client.callTool({
+      name: formatToolName(CHECK_CLAIM),
+      arguments: toArguments(claim),
+    });
+    const content: unknown[] = Array.isArray(result.content) ? result.content : [];
+    const text = content.map(textOf).find((t) => t !== undefined);
+    if (result.isError || text === undefined) {
+      throw new Error(`${formatToolName(CHECK_CLAIM)} failed`);
+    }
+    console.log(render(claim, parseVerdict(text))); // outside data -> domain type
+  } finally {
+    await client.close();
   }
-
-  const result = await client.callTool({
-    name: "expenses___check_claim",
-    arguments: { category: "hotel", amount_eur: 210, city_class: "major" },
-  });
-  console.log(JSON.stringify(result.content));
-  await client.close();
 }
 
-const gatewayUrl = process.env.GATEWAY_URL;
-if (!gatewayUrl) throw new Error("Set GATEWAY_URL");
-await main(gatewayUrl);
+// The text of an MCP content block, if it is a text block.
+function textOf(block: unknown): string | undefined {
+  if (typeof block !== "object" || block === null || !("text" in block)) return undefined;
+  return typeof block.text === "string" ? block.text : undefined;
+}
+
+// The tool arguments, as the tool schema in tools/expenses-tools.json defines them.
+function toArguments(claim: Claim): Record<string, unknown> {
+  return { category: claim.category, amount_eur: eurToJson(claim.amount), city_class: claim.city };
+}
+
+async function main(): Promise<number> {
+  let gateway: GatewayUrl, claim: Claim;
+  try {
+    gateway = parseGatewayUrl(process.env.GATEWAY_URL ?? "");
+    claim = parseClaim({ category: "hotel", amount_eur: 210, city_class: "major" });
+  } catch (error) {
+    if (!(error instanceof ParseError)) throw error;
+    console.error(`error: ${error.message}\nusage: GATEWAY_URL=https://... call-gateway.ts`);
+    return 2;
+  }
+  await check(gateway, claim);
+  return 0;
+}
+
+process.exitCode = await main();

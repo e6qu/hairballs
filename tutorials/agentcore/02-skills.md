@@ -45,18 +45,29 @@ python3 scripts/per_diem.py --days 4 --city-class major
 `--city-class` is `major` or `standard`. Nights are days minus one.
 ````
 
-The script does the arithmetic, so the model does not have to. `expense-policy/scripts/per_diem.py`, the essential part:
+The script does the arithmetic, so the model does not have to. It is one file, because it runs inside the agent's VM, but it has the same three parts as every example: **domain** types that can only hold valid values (`Days` from 1 to 90, a `CityClass` enum, an `Allowance` in whole euros), a pure **core** (`allowance`, `render`), and a small shell (`main`) that parses the arguments. The essential part of `expense-policy/scripts/per_diem.py`:
 
 ```python
-HOTEL_CAP_EUR = {"major": 180, "standard": 120}
+@dataclass(frozen=True, slots=True)
+class Days:
+    """Trip length in days: 1 to 90."""
+
+    count: int
+
+    @classmethod
+    def parse(cls, raw: str) -> Days:
+        if not raw.isdigit() or not 1 <= int(raw) <= 90:
+            raise ParseError(f"days must be a whole number from 1 to 90, not {raw!r}")
+        return cls(int(raw))
+
+
+HOTEL_CAP_EUR = {CityClass.MAJOR: 180, CityClass.STANDARD: 120}
 MEALS_PER_DAY_EUR = 60
 
 
-def allowance(days: int, city_class: str) -> dict[str, int]:
-    nights = max(days - 1, 0)
-    hotel = nights * HOTEL_CAP_EUR[city_class]
-    meals = days * MEALS_PER_DAY_EUR
-    return {"nights": nights, "hotel_eur": hotel, "meals_eur": meals, "total_eur": hotel + meals}
+def allowance(days: Days, city: CityClass) -> Allowance:
+    nights = days.count - 1
+    return Allowance(nights, nights * HOTEL_CAP_EUR[city], days.count * MEALS_PER_DAY_EUR)
 ```
 
 ## Step 2: Test the script locally
@@ -179,52 +190,95 @@ Edit `expense-policy/SKILL.md`, then upload it to a drafts prefix (`./cli.sh dra
 aws s3 sync expense-policy/ "s3://$BUCKET/drafts/expense-policy/"
 ```
 
-Call the harness with the draft. The code also prints each tool call, so you can watch step 4 happen.
+Call the harness with the draft. The code is tutorial 01's, with two additions: a `SkillUri` domain type (an `s3://bucket/path/` folder) and two more stream events, `ToolCalled` and `ToolInputDelta`, so you can watch step 4 happen. `core.render` prints them; `core` is still pure.
+
+The shell and the new part of the boundary parser:
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
 ```python
-response = client.invoke_harness(
-    harnessArn=harness_arn,
-    runtimeSessionId=str(uuid.uuid4()),
-    skills=[{"s3": {"uri": skill_uri}}],  # this call only; same name wins
-    messages=[{"role": "user", "content": [{"text": question}]}],
-)
-for event in response["stream"]:
-    if "contentBlockStart" in event:
-        tool_use = event["contentBlockStart"]["start"].get("toolUse")
-        if tool_use:
-            print(f"\n[tool {tool_use['name']}] ", end="")
-    elif "contentBlockDelta" in event:
-        delta = event["contentBlockDelta"]["delta"]
-        if "toolUse" in delta:
-            print(delta["toolUse"]["input"], end="")  # the tool's arguments
-        elif "text" in delta:
-            print(delta["text"], end="", flush=True)
+def ask(harness: HarnessArn, session: SessionId, question: Question, skill: SkillUri) -> int:
+    client = boto3.client("bedrock-agentcore", region_name="eu-west-1")
+    response = client.invoke_harness(
+        harnessArn=harness.value,
+        runtimeSessionId=session.value,
+        skills=[{"s3": {"uri": skill.value}}],  # this call only; same name wins
+        messages=[{"role": "user", "content": [{"text": question.text}]}],
+    )
+    events: list[StreamEvent] = []
+    for raw in response["stream"]:
+        event = parse_stream_event(raw)  # outside data -> domain type, right here
+        if event is not None:
+            events.append(event)
+            print(render(event), end="", flush=True)
+    return exit_code(events)
 ```
 
 </td><td>
 
 ```typescript
-const response = await client.send(
-  new InvokeHarnessCommand({
-    harnessArn,
-    runtimeSessionId: randomUUID(),
-    skills: [{ s3: { uri: skillUri } }], // this call only; same name wins
-    messages: [{ role: "user", content: [{ text: question }] }],
-  }),
-);
-for await (const event of response.stream ?? []) {
-  const toolUse = event.contentBlockStart?.start?.toolUse;
-  const delta = event.contentBlockDelta?.delta;
-  if (toolUse) {
-    process.stdout.write(`\n[tool ${toolUse.name}] `);
-  } else if (delta?.toolUse) {
-    process.stdout.write(delta.toolUse.input ?? ""); // the tool's arguments
-  } else if (delta?.text) {
-    process.stdout.write(delta.text);
+async function ask(
+  harness: HarnessArn,
+  session: SessionId,
+  question: Question,
+  skill: SkillUri,
+): Promise<number> {
+  const client = new BedrockAgentCoreClient({ region: "eu-west-1" });
+  const response = await client.send(
+    new InvokeHarnessCommand({
+      harnessArn: harness,
+      runtimeSessionId: session,
+      skills: [{ s3: { uri: skill } }], // this call only; same name wins
+      messages: [{ role: "user", content: [{ text: question }] }],
+    }),
+  );
+  const events: StreamEvent[] = [];
+  for await (const raw of response.stream ?? []) {
+    const event = parseStreamEvent(raw); // outside data -> domain type, right here
+    if (event) {
+      events.push(event);
+      process.stdout.write(render(event));
+    }
   }
+  return exitCode(events);
 }
+```
+
+</td></tr><tr><td>
+
+`domain.py`:
+
+```python
+    if "contentBlockStart" in raw:
+        start = _fields(_fields(raw["contentBlockStart"]).get("start", {}))
+        name = _nonempty_str(_fields(start.get("toolUse", {})).get("name"))
+        return ToolCalled(name) if name else None
+    if "contentBlockDelta" in raw:
+        delta = _fields(_fields(raw["contentBlockDelta"]).get("delta", {}))
+        if "toolUse" in delta:
+            text = _nonempty_str(_fields(delta["toolUse"]).get("input"))
+            return ToolInputDelta(text) if text else None
+        text = _nonempty_str(delta.get("text"))
+        return TextDelta(text) if text else None
+```
+
+</td><td>
+
+`domain.ts`:
+
+```typescript
+  if (raw.contentBlockStart) {
+    const name = raw.contentBlockStart.start?.toolUse?.name;
+    return name ? { kind: "toolCalled", name } : undefined;
+  }
+  if (raw.contentBlockDelta) {
+    const delta = raw.contentBlockDelta.delta;
+    if (delta?.toolUse) {
+      const text = delta.toolUse.input;
+      return text ? { kind: "toolInput", text } : undefined;
+    }
+    return delta?.text ? { kind: "text", text: delta.text } : undefined;
+  }
 ```
 
 </td></tr><tr><td>
@@ -245,7 +299,7 @@ npm run invoke -- "Allowance for 4 days in Paris?"
 
 Terraform: [`aws_s3_bucket.skills`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket), [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness), [`aws_iam_policy.invoke`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy)
 
-Full files: [`python/invoke_with_skill.py`](examples/02-skills/python/invoke_with_skill.py), [`typescript/invoke-with-skill.ts`](examples/02-skills/typescript/invoke-with-skill.ts). `HARNESS_ARN` is set as in tutorial 01, step 3. The caller needs the `helpdesk-invoke` policy from tutorial 01.
+Full files: [`python/`](examples/02-skills/python/) (`domain.py`, `core.py`, `invoke_with_skill.py`), [`typescript/`](examples/02-skills/typescript/) (`domain.ts`, `core.ts`, `invoke-with-skill.ts`). `HARNESS_ARN` is set as in tutorial 01, step 3. The caller needs the `helpdesk-invoke` policy from tutorial 01.
 
 You should see a `skills` call with `{"skill_name": "expense-policy"}`, then a `shell` call that runs `per_diem.py`, then the answer. The exact tool arguments depend on the model. **[verify]** the tool names on a live harness: they come from the code that `agentcore export harness` generates.
 

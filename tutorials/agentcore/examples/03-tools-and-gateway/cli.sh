@@ -31,7 +31,7 @@ gateway() {
   aws iam attach-role-policy --role-name helpdesk-expenses-lambda \
     --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
   sleep 10 # IAM changes take a few seconds to apply
-  (cd python && zip -q ../expenses_tool.zip expenses_tool.py)
+  (cd python && zip -q ../expenses_tool.zip domain.py core.py expenses_tool.py)
   aws lambda create-function --function-name helpdesk-expenses \
     --runtime python3.13 --architectures arm64 --handler expenses_tool.handler \
     --zip-file fileb://expenses_tool.zip \

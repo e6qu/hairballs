@@ -54,51 +54,71 @@ Any agent, in any framework, can use the same governed tools. The rest of this t
 
 A Lambda target turns a function into tools. The gateway sends the tool's arguments as the event, and the tool name as `<target>___<tool>` in the Lambda context.
 
+The code has the same three parts as tutorial 01:
+
+- **`domain`**: `Claim` (a `Category` enum, an amount in `Eur`, a `CityClass` enum), `GatewayToolName`, and the result `Verdict` = `WithinPolicy` | `OverLimit` (which always carries the excess). Money is a `Decimal` in Python and integer cents in TypeScript, never a float. The tool arguments and the Lambda context are parsed into these types at the boundary, or rejected with a `ParseError` that names the field.
+- **`core`**: the policy as a pure function, `check_claim(claim) -> Verdict`.
+- **shell**: the Lambda handler. It parses, calls the core and turns the verdict into the JSON the model reads.
+
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
 ```python
-def check_claim(category: str, amount_eur: float, city_class: str = "standard") -> ClaimResult:
-    limit = LIMITS_EUR[category][city_class]
-    return {"within_policy": amount_eur <= limit, "limit_eur": limit}
-
-
-def handler(event: dict[str, str | float], context: GatewayContext) -> ClaimResult:
+def handler(event: object, context: object) -> dict[str, object]:
     # The gateway passes the tool arguments as the event, and the tool name
     # as "<target>___<tool>" in the client context.
-    tool = context.client_context.custom["bedrockAgentCoreToolName"].split("___")[-1]
-    if tool != "check_claim":
-        raise ValueError(f"unknown tool: {tool}")
-    return check_claim(
-        category=str(event["category"]),
-        amount_eur=float(event["amount_eur"]),
-        city_class=str(event.get("city_class", "standard")),
-    )
+    tool = parse_invoked_tool(context)
+    if tool.tool != "check_claim":
+        raise ParseError(f"unknown tool: {tool}")
+    return to_json(check_claim(parse_claim(event)))
 ```
 
 </td><td>
 
 ```typescript
-function checkClaim({ category, amount_eur, city_class = "standard" }: ClaimInput): ClaimResult {
-  const limit = LIMITS_EUR[category]?.[city_class];
-  if (limit === undefined) throw new Error(`unknown category: ${category}/${city_class}`);
-  return { within_policy: amount_eur <= limit, limit_eur: limit };
-}
-
-export async function handler(event: ClaimInput, context: GatewayContext): Promise<ClaimResult> {
+export async function handler(event: unknown, context: unknown): Promise<Record<string, unknown>> {
   // The gateway passes the tool arguments as the event, and the tool name
   // as "<target>___<tool>" in the client context.
-  const custom = context.clientContext?.custom ?? context.clientContext?.Custom ?? {};
-  const tool = (custom.bedrockAgentCoreToolName ?? "").split("___").pop();
-  if (tool !== "check_claim") throw new Error(`unknown tool: ${tool}`);
-  return checkClaim(event);
+  const tool = parseInvokedTool(context);
+  if (tool.tool !== "check_claim") throw new ParseError(`unknown tool: ${formatToolName(tool)}`);
+  return toJson(checkClaim(parseClaim(event)));
+}
+```
+
+</td></tr><tr><td>
+
+The boundary parser (`domain.py`):
+
+```python
+def parse_claim(raw: object) -> Claim:
+    """The check_claim tool's arguments, as the gateway passes them to the Lambda."""
+    fields = _fields(raw, "$")
+    return Claim(
+        category=_enum(Category, fields.get("category"), "$.category"),
+        amount=Eur.parse(fields.get("amount_eur"), "$.amount_eur"),
+        city=_enum(CityClass, fields.get("city_class", "standard"), "$.city_class"),
+    )
+```
+
+</td><td>
+
+The boundary parser (`domain.ts`):
+
+```typescript
+export function parseClaim(raw: unknown): Claim {
+  const f = fields(raw, "$");
+  return {
+    category: oneOf(CATEGORIES, f.category, "$.category"),
+    amount: parseEur(f.amount_eur, "$.amount_eur"),
+    city: oneOf(CITY_CLASSES, f.city_class ?? "standard", "$.city_class"),
+  };
 }
 ```
 
 </td></tr></table>
 
-Full files: [`python/expenses_tool.py`](examples/03-tools-and-gateway/python/expenses_tool.py), [`typescript/expenses-tool.ts`](examples/03-tools-and-gateway/typescript/expenses-tool.ts). The commands below deploy the Python version.
+Full files: [`python/`](examples/03-tools-and-gateway/python/) (`domain.py`, `core.py`, `expenses_tool.py`), [`typescript/`](examples/03-tools-and-gateway/typescript/) (`domain.ts`, `core.ts`, `expenses-tool.ts`). The commands below deploy the Python version: the zip holds `domain.py`, `core.py` and `expenses_tool.py`, with no dependencies.
 
-The gateway does not read the code, so you describe the tool to it in [`tools/expenses-tools.json`](examples/03-tools-and-gateway/tools/expenses-tools.json): name `check_claim`, a description, and a JSON schema with `category`, `amount_eur` and `city_class`.
+The gateway does not read the code, so you describe the tool to it in [`tools/expenses-tools.json`](examples/03-tools-and-gateway/tools/expenses-tools.json): name `check_claim`, a description, and a JSON schema with `category`, `amount_eur` and `city_class`. The schema describes the wire format for the gateway and the model; the code does not mirror it as types, it parses it.
 
 Deploy the function. It needs only a role that can write logs.
 
@@ -113,7 +133,7 @@ aws iam create-role --role-name helpdesk-expenses-lambda \
   --assume-role-policy-document file://iam/lambda-trust-policy.json
 aws iam attach-role-policy --role-name helpdesk-expenses-lambda \
   --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-(cd python && zip -q ../expenses_tool.zip expenses_tool.py)
+(cd python && zip -q ../expenses_tool.zip domain.py core.py expenses_tool.py)
 aws lambda create-function --function-name helpdesk-expenses \
   --runtime python3.13 --architectures arm64 --handler expenses_tool.handler \
   --zip-file fileb://expenses_tool.zip \
@@ -125,8 +145,15 @@ aws lambda create-function --function-name helpdesk-expenses \
 ```hcl
 data "archive_file" "expenses" {
   type        = "zip"
-  source_file = "${path.module}/../python/expenses_tool.py"
   output_path = "${path.module}/expenses_tool.zip"
+
+  dynamic "source" {
+    for_each = ["domain.py", "core.py", "expenses_tool.py"]
+    content {
+      filename = source.value
+      content  = file("${path.module}/../python/${source.value}")
+    }
+  }
 }
 
 resource "aws_lambda_function" "expenses" {
@@ -305,7 +332,99 @@ The gateway is a normal MCP server. Any MCP client can list and call its tools, 
 
 Because the gateway uses `AWS_IAM`, every HTTP request must be signed with SigV4 (service `bedrock-agentcore`). Neither MCP SDK does this, so give each one a signing hook: an `httpx2.Auth` in Python (the `mcp` 2.x SDK uses `httpx2`), a custom `fetch` in TypeScript.
 
+The client reuses the same `domain` and `core`. The shell parses `GATEWAY_URL` into a `GatewayUrl`, sends a `Claim` as tool arguments, and parses the tool's text result back into a `Verdict` before `core.render` prints it.
+
 <table><tr><th>Python (<code>mcp</code> 2.2)</th><th>TypeScript (<code>@modelcontextprotocol/sdk</code> 1.30)</th></tr><tr><td>
+
+```python
+async def check(gateway: GatewayUrl, claim: Claim) -> None:
+    timeout = httpx2.Timeout(30, read=300)  # the server may hold a stream open
+    async with httpx2.AsyncClient(auth=SigV4("eu-west-1"), timeout=timeout) as http:
+        async with Client(streamable_http_client(gateway.value, http_client=http)) as client:
+            listed = await client.list_tools()
+            print("tools:", ", ".join(tool.name for tool in listed.tools))
+
+            result = await client.call_tool(str(CHECK_CLAIM), to_arguments(claim))
+            texts = [block.text for block in result.content if isinstance(block, TextContent)]
+            if result.is_error or not texts:
+                raise RuntimeError(f"{CHECK_CLAIM} failed: {texts}")
+            print(render(claim, parse_verdict(texts[0])))  # outside data -> domain type
+```
+
+</td><td>
+
+```typescript
+async function check(gateway: GatewayUrl, claim: Claim): Promise<void> {
+  const client = new Client({ name: "helpdesk-app", version: "0.1.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(gateway), { fetch: signedFetch }));
+  try {
+    const { tools } = await client.listTools();
+    console.log(`tools: ${tools.map((t) => t.name).join(", ")}`);
+
+    const result = await client.callTool({
+      name: formatToolName(CHECK_CLAIM),
+      arguments: toArguments(claim),
+    });
+    const content: unknown[] = Array.isArray(result.content) ? result.content : [];
+    const text = content.map(textOf).find((t) => t !== undefined);
+    if (result.isError || text === undefined) {
+      throw new Error(`${formatToolName(CHECK_CLAIM)} failed`);
+    }
+    console.log(render(claim, parseVerdict(text))); // outside data -> domain type
+  } finally {
+    await client.close();
+  }
+}
+```
+
+</td></tr><tr><td>
+
+The boundary parser for the result (`domain.py`):
+
+```python
+def parse_verdict(text: str) -> Verdict:
+    """The check_claim result, as the MCP client receives it (JSON text)."""
+    try:
+        fields = _fields(json.loads(text), "$")
+    except json.JSONDecodeError as exc:
+        raise ParseError(f"$: not JSON: {text[:80]!r}") from exc
+    limit = Eur.parse(fields.get("limit_eur"), "$.limit_eur")
+    match fields.get("within_policy"):
+        case True:
+            return WithinPolicy(limit)
+        case False:
+            return OverLimit(limit, Eur.parse(fields.get("excess_eur"), "$.excess_eur"))
+        case other:
+            raise ParseError(f"$.within_policy: expected true or false, got {other!r}")
+```
+
+</td><td>
+
+The boundary parser for the result (`domain.ts`):
+
+```typescript
+export function parseVerdict(text: string): Verdict {
+  let json: unknown;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    throw new ParseError(`$: not JSON: ${text.slice(0, 80)}`);
+  }
+  const f = fields(json, "$");
+  const limit = parseEur(f.limit_eur, "$.limit_eur");
+  if (f.within_policy === true) return { kind: "within", limit };
+  if (f.within_policy === false) {
+    return { kind: "over", limit, excess: parseEur(f.excess_eur, "$.excess_eur") };
+  }
+  throw new ParseError(
+    `$.within_policy: expected true or false, got ${JSON.stringify(f.within_policy)}`,
+  );
+}
+```
+
+</td></tr><tr><td>
+
+The signing hook:
 
 ```python
 class SigV4(httpx2.Auth):
@@ -326,23 +445,11 @@ class SigV4(httpx2.Auth):
         self.signer.add_auth(signed)  # adds Authorization and X-Amz-Date headers
         request.headers.update(dict(signed.headers.items()))
         yield request
-
-
-async def main(gateway_url: str) -> None:
-    timeout = httpx2.Timeout(30, read=300)  # the server may hold a stream open
-    async with httpx2.AsyncClient(auth=SigV4("eu-west-1"), timeout=timeout) as http:
-        async with Client(streamable_http_client(gateway_url, http_client=http)) as client:
-            listed = await client.list_tools()
-            for tool in listed.tools:
-                print(tool.name)  # "<target>___<tool>", e.g. expenses___check_claim
-
-            result = await client.call_tool(
-                "expenses___check_claim",
-                {"category": "hotel", "amount_eur": 210, "city_class": "major"},
-            )
 ```
 
 </td><td>
+
+The signing hook:
 
 ```typescript
 const signer = new SignatureV4({
@@ -352,7 +459,6 @@ const signer = new SignatureV4({
   sha256: Sha256,
 });
 
-// A fetch that signs each request (adds Authorization and X-Amz-Date headers).
 async function signedFetch(url: string | URL, init: RequestInit = {}): Promise<Response> {
   const target = new URL(url);
   const signed = await signer.sign({
@@ -371,22 +477,6 @@ async function signedFetch(url: string | URL, init: RequestInit = {}): Promise<R
   }
   return fetch(target, { ...init, headers });
 }
-
-async function main(gatewayUrl: string): Promise<void> {
-  const client = new Client({ name: "helpdesk-app", version: "0.1.0" });
-  await client.connect(
-    new StreamableHTTPClientTransport(new URL(gatewayUrl), { fetch: signedFetch }),
-  );
-
-  const { tools } = await client.listTools();
-  for (const tool of tools) {
-    console.log(tool.name); // "<target>___<tool>", e.g. expenses___check_claim
-  }
-
-  const result = await client.callTool({
-    name: "expenses___check_claim",
-    arguments: { category: "hotel", amount_eur: 210, city_class: "major" },
-  });
 ```
 
 </td></tr><tr><td>
@@ -407,7 +497,7 @@ GATEWAY_URL=$(terraform -chdir=../terraform output -raw gateway_url) \
 
 </td></tr></table>
 
-Full files: [`python/call_gateway.py`](examples/03-tools-and-gateway/python/call_gateway.py), [`typescript/call-gateway.ts`](examples/03-tools-and-gateway/typescript/call-gateway.ts). With the AWS CLI, `get-gateway --query gatewayUrl` prints the URL.
+Full files: [`python/call_gateway.py`](examples/03-tools-and-gateway/python/call_gateway.py), [`typescript/call-gateway.ts`](examples/03-tools-and-gateway/typescript/call-gateway.ts), plus `domain` and `core`. With the AWS CLI, `get-gateway --query gatewayUrl` prints the URL.
 
 Terraform: [`aws_bedrockagentcore_gateway.tools`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway), [`aws_iam_policy.invoke_gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy)
 

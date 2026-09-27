@@ -1,7 +1,9 @@
-"""Ask the helpdesk with an extra skill for this one call, and show the tools it uses.
+"""Ask the helpdesk with an extra skill for this one call, and show the tools it uses (the shell).
 
 Usage: HARNESS_ARN=arn:... uv run python invoke_with_skill.py "question" [skill-s3-uri]
 """
+
+from __future__ import annotations
 
 import os
 import sys
@@ -9,33 +11,51 @@ import uuid
 
 import boto3
 
+from core import exit_code, render
+from domain import (
+    HarnessArn,
+    ParseError,
+    Question,
+    SessionId,
+    SkillUri,
+    StreamEvent,
+    parse_stream_event,
+)
+
 DRAFT_SKILL = "s3://fintech-agent-skills/drafts/expense-policy/"
 
 
-def ask(harness_arn: str, question: str, skill_uri: str) -> None:
+def ask(harness: HarnessArn, session: SessionId, question: Question, skill: SkillUri) -> int:
     client = boto3.client("bedrock-agentcore", region_name="eu-west-1")
     response = client.invoke_harness(
-        harnessArn=harness_arn,
-        runtimeSessionId=str(uuid.uuid4()),
-        skills=[{"s3": {"uri": skill_uri}}],  # this call only; same name wins
-        messages=[{"role": "user", "content": [{"text": question}]}],
+        harnessArn=harness.value,
+        runtimeSessionId=session.value,
+        skills=[{"s3": {"uri": skill.value}}],  # this call only; same name wins
+        messages=[{"role": "user", "content": [{"text": question.text}]}],
     )
-    for event in response["stream"]:
-        if "contentBlockStart" in event:
-            tool_use = event["contentBlockStart"]["start"].get("toolUse")
-            if tool_use:
-                print(f"\n[tool {tool_use['name']}] ", end="")
-        elif "contentBlockDelta" in event:
-            delta = event["contentBlockDelta"]["delta"]
-            if "toolUse" in delta:
-                print(delta["toolUse"]["input"], end="")  # the tool's arguments
-            elif "text" in delta:
-                print(delta["text"], end="", flush=True)
-        elif "runtimeClientError" in event:
-            raise RuntimeError(event["runtimeClientError"].get("message"))
-    print()
+    events: list[StreamEvent] = []
+    for raw in response["stream"]:
+        event = parse_stream_event(raw)  # outside data -> domain type, right here
+        if event is not None:
+            events.append(event)
+            print(render(event), end="", flush=True)
+    return exit_code(events)
+
+
+def main(argv: list[str]) -> int:
+    try:
+        harness = HarnessArn.parse(os.environ.get("HARNESS_ARN", ""))
+        question = Question.parse(argv[1] if len(argv) > 1 else "")
+        skill = SkillUri.parse(argv[2] if len(argv) > 2 else DRAFT_SKILL)
+        session = SessionId.parse(str(uuid.uuid4()))
+    except ParseError as exc:
+        print(
+            f"error: {exc}\nusage: HARNESS_ARN=arn:... invoke_with_skill.py QUESTION [SKILL_S3_URI]",
+            file=sys.stderr,
+        )
+        return 2
+    return ask(harness, session, question, skill)
 
 
 if __name__ == "__main__":
-    skill = sys.argv[2] if len(sys.argv) > 2 else DRAFT_SKILL
-    ask(os.environ["HARNESS_ARN"], sys.argv[1], skill)
+    sys.exit(main(sys.argv))

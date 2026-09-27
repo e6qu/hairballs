@@ -21,8 +21,15 @@ locals {
 
 data "archive_file" "expenses" {
   type        = "zip"
-  source_file = "${path.module}/../python/expenses_tool.py"
   output_path = "${path.module}/expenses_tool.zip"
+
+  dynamic "source" {
+    for_each = ["domain.py", "core.py", "expenses_tool.py"]
+    content {
+      filename = source.value
+      content  = file("${path.module}/../python/${source.value}")
+    }
+  }
 }
 
 resource "aws_iam_role" "expenses_lambda" {
@@ -92,7 +99,7 @@ resource "aws_bedrockagentcore_gateway_target" "expenses" {
         tool_schema {
           inline_payload {
             name        = "check_claim"
-            description = "Check whether an expense amount is within Fintech Ltd policy. Returns within_policy and limit_eur."
+            description = "Check whether an expense amount is within Fintech Ltd policy. Returns within_policy, limit_eur and, when over the limit, excess_eur."
             input_schema {
               type = "object"
               property {

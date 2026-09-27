@@ -1,38 +1,33 @@
-// Lambda function behind the gateway. It implements one tool: check_claim.
+// Lambda function behind the gateway, implementing the tool check_claim (the shell).
 // Deploy compiled to JavaScript with runtime nodejs22.x and handler "expenses-tool.handler".
+import { checkClaim } from "./core.ts";
+import {
+  ParseError,
+  type Verdict,
+  eurToJson,
+  formatToolName,
+  parseClaim,
+  parseInvokedTool,
+} from "./domain.ts";
 
-const LIMITS_EUR: Record<string, Record<string, number>> = {
-  hotel: { major: 180, standard: 120 },
-  meals: { major: 60, standard: 60 },
-};
-
-interface ClaimInput {
-  category: string;
-  amount_eur: number;
-  city_class?: string;
-}
-
-interface ClaimResult {
-  within_policy: boolean;
-  limit_eur: number;
-}
-
-interface GatewayContext {
-  // Node receives the client context as sent; handle both spellings of "custom".
-  clientContext?: { custom?: Record<string, string>; Custom?: Record<string, string> };
-}
-
-function checkClaim({ category, amount_eur, city_class = "standard" }: ClaimInput): ClaimResult {
-  const limit = LIMITS_EUR[category]?.[city_class];
-  if (limit === undefined) throw new Error(`unknown category: ${category}/${city_class}`);
-  return { within_policy: amount_eur <= limit, limit_eur: limit };
-}
-
-export async function handler(event: ClaimInput, context: GatewayContext): Promise<ClaimResult> {
+export async function handler(event: unknown, context: unknown): Promise<Record<string, unknown>> {
   // The gateway passes the tool arguments as the event, and the tool name
   // as "<target>___<tool>" in the client context.
-  const custom = context.clientContext?.custom ?? context.clientContext?.Custom ?? {};
-  const tool = (custom.bedrockAgentCoreToolName ?? "").split("___").pop();
-  if (tool !== "check_claim") throw new Error(`unknown tool: ${tool}`);
-  return checkClaim(event);
+  const tool = parseInvokedTool(context);
+  if (tool.tool !== "check_claim") throw new ParseError(`unknown tool: ${formatToolName(tool)}`);
+  return toJson(checkClaim(parseClaim(event)));
+}
+
+// The tool result the model reads.
+function toJson(verdict: Verdict): Record<string, unknown> {
+  switch (verdict.kind) {
+    case "within":
+      return { within_policy: true, limit_eur: eurToJson(verdict.limit) };
+    case "over":
+      return {
+        within_policy: false,
+        limit_eur: eurToJson(verdict.limit),
+        excess_eur: eurToJson(verdict.excess),
+      };
+  }
 }
