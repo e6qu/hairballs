@@ -4,9 +4,8 @@ Ten short tutorials. Each teaches one thing and builds on the one before. The ru
 
 Every tutorial shows:
 
-- the **`agentcore` CLI** where it is the simplest path;
 - **application code** side by side, **Python | TypeScript**;
-- **infrastructure** side by side, **AWS CLI | Terraform**.
+- **infrastructure** side by side, **agentcore CLI | AWS CLI | Terraform**.
 
 The full, checked source for each tutorial is in [`examples/`](examples/).
 
