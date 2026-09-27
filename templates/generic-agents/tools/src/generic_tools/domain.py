@@ -7,6 +7,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
+from org_agents.identity import Caller, EmailAddress, HumanUser, ServiceClient
 from org_agents.parsing import ParseError, expect_int, expect_non_empty_str
 
 # ---------------------------------------------------------------- calculator
@@ -95,6 +96,52 @@ class HitLimit:
         return cls(value)
 
 
+# ---------------------------------------------------------------- requester
+
+
+@dataclass(frozen=True, slots=True)
+class Requester:
+    """Who asked for a ticket. ``reference`` is the org ``UserId`` for people (stable across email and
+    name changes) or the Auth0 client subject for services. ``name``/``email`` are PII."""
+
+    reference: str
+    name: str
+    email: EmailAddress | None
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[A-Za-z0-9._:@|-]{1,256}", self.reference):
+            raise ValueError("invalid requester reference")
+        if not 1 <= len(self.name) <= 201:
+            raise ValueError("invalid requester name")
+
+    @classmethod
+    def from_caller(cls, caller: Caller) -> Requester:
+        match caller:
+            case HumanUser(user_id=user_id, email=email):
+                return cls(user_id.value, caller.display_name, email)
+            case ServiceClient(subject=subject):
+                return cls(subject.value, caller.display_name, None)
+
+    @classmethod
+    def parse(cls, reference: object, name: object, email: object, path: str = "$.requester") -> Requester:
+        """For requester fields arriving over MCP (set by the calling harness, never by the model)."""
+        ref = expect_non_empty_str(reference, f"{path}.reference", max_length=256)
+        if not re.fullmatch(r"[A-Za-z0-9._:@|-]{1,256}", ref):
+            raise ParseError(f"{path}.reference", "is not a user id or client subject")
+        return cls(
+            reference=ref,
+            name=expect_non_empty_str(name, f"{path}.name", max_length=201),
+            email=EmailAddress.parse(email, f"{path}.email") if email not in (None, "") else None,
+        )
+
+    def render(self) -> str:
+        return (
+            f"{self.name} <{self.email.value}> ({self.reference})"
+            if self.email
+            else f"{self.name} ({self.reference})"
+        )
+
+
 # ---------------------------------------------------------------- tickets
 
 
@@ -170,4 +217,4 @@ class Ticket:
     title: TicketTitle
     description: TicketDescription
     priority: TicketPriority
-    requested_by: str
+    requested_by: Requester

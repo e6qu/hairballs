@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from org_agents.core.guard import StopRun
 from org_agents.domain import ApprovalId, PrincipalId, ToolName
+from org_agents.identity import Caller
 from org_agents.parsing import expect_bool, expect_mapping, expect_sequence
 
 
@@ -85,6 +86,7 @@ class ApprovalRequested:
     tool: ToolName
     reason: str
     approvers: frozenset[PrincipalId]
+    requester: Caller | None = None  # shown to approvers (name/email); None when unknown
 
 
 @dataclass(frozen=True, slots=True)

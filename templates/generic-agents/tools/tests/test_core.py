@@ -1,5 +1,7 @@
 from decimal import Decimal
 
+from org_agents.identity import EmailAddress
+
 from generic_tools.core.calculator import calculate
 from generic_tools.core.knowledge import search
 from generic_tools.core.tickets import AlreadyCreated, CreateTicket, plan_ticket
@@ -11,11 +13,14 @@ from generic_tools.domain import (
     Expression,
     HitLimit,
     KnowledgeQuery,
+    Requester,
     TicketDescription,
     TicketPriority,
     TicketRequest,
     TicketTitle,
 )
+
+ALICE = Requester("usr_1", "Alice Doe", EmailAddress("alice@x.io"))
 
 
 def test_calculator_is_exact() -> None:
@@ -45,7 +50,7 @@ def test_ticket_plan_is_idempotent() -> None:
     request = TicketRequest(
         TicketTitle("VPN broken"), TicketDescription("Cannot connect"), TicketPriority.HIGH
     )
-    first = plan_ticket(request, "alice", None, 1)
+    first = plan_ticket(request, ALICE, None, 1)
     assert isinstance(first, CreateTicket) and first.ticket.id.value == "TCK-000001"
-    again = plan_ticket(request, "alice", first.ticket, 2)
+    again = plan_ticket(request, ALICE, first.ticket, 2)
     assert again == AlreadyCreated(first.ticket)

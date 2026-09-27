@@ -11,6 +11,7 @@ from typing import Protocol
 from generic_tools.domain import (
     Document,
     DocumentId,
+    Requester,
     Ticket,
     TicketDescription,
     TicketId,
@@ -60,6 +61,9 @@ class TicketStore(Protocol):
     def save(self, ticket: Ticket, key: str) -> None: ...
 
 
+_COLUMNS = "id, title, description, priority, requester_ref, requester_name, requester_email"
+
+
 class SqliteTicketStore:
     """SQLite ticket store (``:memory:`` for tests and local runs). Unique on idempotency key."""
 
@@ -70,23 +74,23 @@ class SqliteTicketStore:
             self._db.execute(
                 "CREATE TABLE IF NOT EXISTS tickets (id TEXT PRIMARY KEY, idem_key TEXT UNIQUE NOT NULL,"
                 " title TEXT NOT NULL, description TEXT NOT NULL, priority TEXT NOT NULL,"
-                " requested_by TEXT NOT NULL)"
+                " requester_ref TEXT NOT NULL, requester_name TEXT NOT NULL, requester_email TEXT)"
             )
 
-    def _row_to_ticket(self, row: tuple[str, str, str, str, str]) -> Ticket:
+    def _row_to_ticket(self, row: tuple[str, str, str, str, str, str, str | None]) -> Ticket:
         # Rows come from our own writes, but they are still parsed back into domain types.
         return Ticket(
             id=TicketId(row[0]),
             title=TicketTitle(row[1]),
             description=TicketDescription(row[2]),
             priority=TicketPriority(row[3]),
-            requested_by=row[4],
+            requested_by=Requester.parse(row[4], row[5], row[6], "$.tickets.requester"),
         )
 
     def by_key(self, key: str) -> Ticket | None:
         with self._lock:
             row = self._db.execute(
-                "SELECT id, title, description, priority, requested_by FROM tickets WHERE idem_key = ?",
+                f"SELECT {_COLUMNS} FROM tickets WHERE idem_key = ?",
                 (key,),
             ).fetchone()
         return self._row_to_ticket(row) if row else None
@@ -94,7 +98,7 @@ class SqliteTicketStore:
     def get(self, ticket_id: TicketId) -> Ticket | None:
         with self._lock:
             row = self._db.execute(
-                "SELECT id, title, description, priority, requested_by FROM tickets WHERE id = ?",
+                f"SELECT {_COLUMNS} FROM tickets WHERE id = ?",
                 (ticket_id.value,),
             ).fetchone()
         return self._row_to_ticket(row) if row else None
@@ -107,13 +111,15 @@ class SqliteTicketStore:
     def save(self, ticket: Ticket, key: str) -> None:
         with self._lock, self._db:
             self._db.execute(
-                "INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO tickets VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     ticket.id.value,
                     key,
                     ticket.title.text,
                     ticket.description.text,
                     ticket.priority.value,
-                    ticket.requested_by,
+                    ticket.requested_by.reference,
+                    ticket.requested_by.name,
+                    ticket.requested_by.email.value if ticket.requested_by.email else None,
                 ),
             )

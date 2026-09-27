@@ -17,8 +17,10 @@ import os
 
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from org_agents.parsing import ParseError
 from org_agents.shell.fingerprint import fingerprint_arguments
 
+from generic_tools.domain import Requester
 from generic_tools.shell.backends import LocalCorpus, SqliteTicketStore
 from generic_tools.shell.service import TOOL_DESCRIPTIONS, GenericTools, ToolFailure, ToolResult
 
@@ -47,13 +49,21 @@ def create_ticket(
     title: str,
     description: str,
     priority: str = "normal",
-    requested_by: str = "unknown",
+    requester_id: str = "",
+    requester_name: str = "",
+    requester_email: str = "",
     idempotency_key: str = "",
 ) -> str:
-    """``requested_by`` and ``idempotency_key`` are set by the calling harness's guard, not the model."""
+    """``requester_*`` and ``idempotency_key`` are set by the calling harness's guard from the verified
+    caller identity, never by the model. Behind AgentCore Gateway the Cedar policy can also require
+    them to match the caller's token claims."""
+    try:
+        requester = Requester.parse(requester_id, requester_name, requester_email)
+    except ParseError as exc:
+        raise ToolError(f"missing or invalid requester (set by the harness): {exc}") from exc
     args = {"title": title, "description": description, "priority": priority}
     key = idempotency_key or f"content-{fingerprint_arguments(args).value[:32]}"
-    return _out(_tools.create_ticket(args, requested_by, key))
+    return _out(_tools.create_ticket(args, requester, key))
 
 
 @mcp.tool(description=TOOL_DESCRIPTIONS["get_ticket"])

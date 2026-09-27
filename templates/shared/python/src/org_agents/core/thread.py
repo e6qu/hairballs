@@ -33,6 +33,7 @@ from org_agents.core.messages import (
     on_message,
 )
 from org_agents.domain import MessageId, PrincipalId, Prompt
+from org_agents.identity import Caller
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,7 +78,11 @@ def receive(state: ThreadState, message: Incoming, busy: BusyPolicy) -> tuple[Th
 
 
 def finish(
-    state: ThreadState, outcome: RunOutcome, owner: PrincipalId, approvals: ApprovalPolicy
+    state: ThreadState,
+    outcome: RunOutcome,
+    owner: PrincipalId,
+    approvals: ApprovalPolicy,
+    requester: Caller | None = None,
 ) -> tuple[ThreadState, Reply]:
     match outcome:
         case Completed(text=text):
@@ -85,7 +90,7 @@ def finish(
         case ApprovalNeeded(approval_id=aid, tool=tool, reason=reason):
             approvers = approvals.approvers_for(owner)
             status = AwaitingApproval(owner=owner, approval_id=aid, approvers=approvers)
-            return replace(state, status=status), ApprovalRequested(aid, tool, reason, approvers)
+            return replace(state, status=status), ApprovalRequested(aid, tool, reason, approvers, requester)
         case Stopped(stop=stop, text=text):
             # A stopped run also drops queued follow-ups: limits apply to the thread's work, not one prompt.
             return replace(state, status=Idle(), follow_ups=()), RunHalted(stop, text)

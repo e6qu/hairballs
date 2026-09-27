@@ -21,6 +21,7 @@ from generic_tools.domain import (
     Expression,
     HitLimit,
     KnowledgeQuery,
+    Requester,
     Ticket,
     TicketDescription,
     TicketId,
@@ -55,7 +56,7 @@ TOOL_DESCRIPTIONS: Mapping[str, str] = {
 def _render_ticket(ticket: Ticket) -> str:
     return (
         f"{ticket.id.value} [{ticket.priority.value}] {ticket.title.text}\n"
-        f"requested by {ticket.requested_by}\n{ticket.description.text}"
+        f"requested by {ticket.requested_by.render()}\n{ticket.description.text}"
     )
 
 
@@ -88,7 +89,7 @@ class GenericTools:
             return ToolSuccess("No matching documents.")
         return ToolSuccess("\n".join(f"[{h.document.value}] {h.title}: {h.snippet}" for h in hits))
 
-    def create_ticket(self, raw_args: object, requested_by: str, idempotency_key: str) -> ToolResult:
+    def create_ticket(self, raw_args: object, requested_by: Requester, idempotency_key: str) -> ToolResult:
         """Only call after the guard has obtained approval. Safe to retry: same key → same ticket."""
         try:
             args = expect_mapping(raw_args, "$")

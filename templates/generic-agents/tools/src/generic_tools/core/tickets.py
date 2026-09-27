@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from generic_tools.domain import Ticket, TicketId, TicketRequest
+from generic_tools.domain import Requester, Ticket, TicketId, TicketRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,7 +21,7 @@ TicketPlan = CreateTicket | AlreadyCreated
 
 
 def plan_ticket(
-    request: TicketRequest, requested_by: str, existing: Ticket | None, next_number: int
+    request: TicketRequest, requested_by: Requester, existing: Ticket | None, next_number: int
 ) -> TicketPlan:
     """``existing`` is the ticket already stored under this request's idempotency key, if any."""
     if existing is not None:

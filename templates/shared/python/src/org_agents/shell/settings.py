@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from org_agents.conversation import ApprovalPolicy
+from org_agents.identity import DEFAULT_CLAIMS, ClaimNames
 from org_agents.parsing import expect_mapping
 from org_agents.shell.config import AgentConfig, parse_agent_config
 
@@ -17,6 +18,7 @@ class Settings:
     agent: AgentConfig
     approvals: ApprovalPolicy
     system_prompt: str
+    identity: ClaimNames = DEFAULT_CLAIMS
 
 
 def parse_settings(raw: object, env: Mapping[str, str], system_prompt: str) -> Settings:
@@ -25,6 +27,7 @@ def parse_settings(raw: object, env: Mapping[str, str], system_prompt: str) -> S
         agent=parse_agent_config(raw, env),
         approvals=ApprovalPolicy.parse(doc.get("approvals", {})),
         system_prompt=system_prompt,
+        identity=ClaimNames.parse(doc.get("identity", {})),
     )
 
 

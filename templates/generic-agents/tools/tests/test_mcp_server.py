@@ -70,3 +70,31 @@ def test_call_and_error_reason(server: str) -> None:
     assert (
         isinstance(bad, dict) and bad["isError"] is True and "division by zero" in bad["content"][0]["text"]
     )
+
+
+def test_create_ticket_requires_harness_supplied_requester(server: str) -> None:
+    args = {"title": "VPN broken", "description": "cannot connect"}
+    missing = rpc(server, "tools/call", {"name": "create_ticket", "arguments": args})["result"]
+    assert (
+        isinstance(missing, dict)
+        and missing["isError"] is True
+        and "requester" in missing["content"][0]["text"]
+    )
+    ok = rpc(
+        server,
+        "tools/call",
+        {
+            "name": "create_ticket",
+            "arguments": {
+                **args,
+                "requester_id": "usr_1",
+                "requester_name": "Jane Doe",
+                "requester_email": "jane@x.io",
+            },
+        },
+    )["result"]
+    assert (
+        isinstance(ok, dict)
+        and ok["isError"] is False
+        and "Jane Doe <jane@x.io> (usr_1)" in ok["content"][0]["text"]
+    )
