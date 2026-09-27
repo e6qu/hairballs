@@ -1,0 +1,77 @@
+# Scenario evals for the generic agents. All 8 variants serve the same AgentCore contract, so one
+# suite scores every one of them the same way. Run on demand only (it calls Bedrock and costs money):
+#
+#   cd templates/shared/evals && uv sync --extra bedrock
+#   uv run org-evals run --suite ../../generic-agents/evals --variant strands-sdk --out /tmp/evals/strands-sdk
+
+[suite]
+name = "generic-agents"
+region = "eu-west-1"
+claim_namespace = "https://fintech.example/"
+# A cheap model keeps eval runs cheap. Evaluate with the production model before promoting a change.
+agent_model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+judge_model = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
+
+# USD per 1M tokens. Illustrative list prices: check the Bedrock pricing page for your region/profile.
+[models."global.anthropic.claude-haiku-4-5-20251001-v1:0"]
+alias = "haiku"
+input_per_mtok = "1.00"
+output_per_mtok = "5.00"
+cache_read_per_mtok = "0.10"
+cache_write_per_mtok = "1.25"
+
+[models."global.anthropic.claude-sonnet-4-6"]
+alias = "sonnet"
+input_per_mtok = "3.00"
+output_per_mtok = "15.00"
+cache_read_per_mtok = "0.30"
+cache_write_per_mtok = "3.75"
+
+[defaults]
+repeats = 3                  # models are not deterministic: every scenario runs several times
+concurrency = 4
+max_usd = "2.00"             # budget per `org-evals run` (agent + judge); new runs stop when reached
+request_timeout_seconds = 300
+
+# The category's tools as an MCP server, for the TypeScript harnesses (fresh in-memory tickets per run).
+[services.tools-mcp]
+dir = "../tools"
+command = ["uv", "run", "--extra", "mcp", "python", "-m", "generic_tools.shell.mcp_server"]
+env = { MCP_PORT = "8000" }
+port = 8000
+
+[variants.strands-sdk]
+dir = "../strands-sdk"
+command = ["uv", "run", "python", "-m", "generic_agent_strands.shell.app"]
+
+[variants.strands-harness]
+dir = "../strands-harness"
+command = ["uv", "run", "python", "-m", "generic_agent_strands_harness.shell.app"]
+
+[variants.pydantic-sdk]
+dir = "../pydantic-sdk"
+command = ["uv", "run", "python", "-m", "generic_agent_pydantic.shell.app"]
+
+[variants.pydantic-harness]
+dir = "../pydantic-harness"
+command = ["uv", "run", "python", "-m", "generic_agent_pydantic_harness.shell.app"]
+
+[variants.langgraph-sdk]
+dir = "../langgraph-sdk"
+command = ["uv", "run", "python", "-m", "generic_agent_langgraph.shell.app"]
+
+[variants.langgraph-harness]
+dir = "../langgraph-harness"
+command = ["uv", "run", "python", "-m", "generic_agent_deepagents.shell.app"]
+
+[variants.pi-harness]
+dir = "../pi-harness"
+command = ["node", "src/shell/app.ts"]
+services = ["tools-mcp"]
+env = { TOOLS_MCP_URL = "http://127.0.0.1:8000/mcp" }
+
+[variants.opencode-harness]
+dir = "../opencode-harness"
+command = ["node", "src/shell/app.ts"]
+services = ["tools-mcp"]
+env = { TOOLS_MCP_URL = "http://127.0.0.1:8000/mcp" }

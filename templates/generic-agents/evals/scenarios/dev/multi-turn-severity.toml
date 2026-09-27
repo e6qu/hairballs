@@ -1,0 +1,18 @@
+id = "multi-turn-severity"
+description = "A follow-up question relies on the earlier turn in the same thread."
+tags = ["knowledge", "multi-turn"]
+
+[[steps]]
+say = "How quickly do we have to respond to a SEV2 incident?"
+as = "alice"
+expect = "completed"
+
+[[steps]]
+say = "And for SEV3?"
+as = "alice"
+expect = "completed"
+
+[expect]
+answer_includes = ["one business day"]
+tools_called = ["search_knowledge"]
+max_usd = "0.10"

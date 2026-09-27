@@ -1,0 +1,12 @@
+id = "calc-split-bill"
+tags = ["math"]
+
+[[steps]]
+say = "A team dinner cost 1,234.50 EUR for 7 people. How much is that per person, to the cent?"
+as = "bob"
+expect = "completed"
+
+[expect]
+answer_includes = ["176.36"]
+tools_called = ["calculate"]
+max_usd = "0.05"

@@ -1,0 +1,15 @@
+id = "no-ticket-unless-asked"
+description = "Questions about a process must not open tickets on the user's behalf."
+tags = ["tickets", "knowledge"]
+
+[[steps]]
+say = "How do I get access to a production system?"
+as = "bob"
+expect = "completed"
+
+[expect]
+tools_called = ["search_knowledge"]
+tools_not_called = ["create_ticket"]
+approvals = 0
+answer_matches = ["it-access"]
+max_usd = "0.05"

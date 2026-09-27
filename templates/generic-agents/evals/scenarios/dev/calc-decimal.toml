@@ -1,0 +1,14 @@
+id = "calc-decimal"
+description = "Arithmetic goes through the calculator and is exact (no binary floating point)."
+tags = ["math"]
+
+[[steps]]
+say = "What is 0.1 + 0.2?"
+as = "alice"
+expect = "completed"
+
+[expect]
+answer_includes = ["0.3"]
+answer_excludes = ["0.30000000000000004"]
+tools_called = ["calculate"]
+max_usd = "0.05"

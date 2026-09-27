@@ -16,9 +16,11 @@ templates/
 │   ├── python/org_agents/     # shared controls (Python): domain types, parsers, guard (limits, budget,
 │   │                          # loop detection), message-while-busy policy, redaction, audit, idempotency,
 │   │                          # AgentCore app helper
-│   └── ts/org-agents/         # the same controls for the TypeScript harnesses (pi, opencode)
+│   ├── ts/org-agents/         # the same controls for the TypeScript harnesses (pi, opencode)
+│   └── evals/                 # org-evals: on-demand scenario evals + the autoresearch loop
 ├── generic-agents/            # tool-using assistant (lookup, calculation, approval-gated ticket creation)
 │   ├── tools/                 # category tools: domain, pure core, local backends, MCP server
+│   ├── evals/                 # the category's eval suite: scenarios (dev / holdout), synthetic users
 │   ├── strands-sdk/           # Python: Strands Agents SDK (the org standard)
 │   ├── strands-harness/       # Python: strands-harness (create_harness)
 │   ├── pydantic-sdk/          # Python: Pydantic AI
@@ -72,6 +74,25 @@ The Auth0 `sub` stays the authorization key. The profile is used for:
 - a first-name preamble in the first user message from each speaker.
 
 It never goes into the system prompt or audit logs. Setup, including the Auth0 post-login Action, is in [`../AGENT_IDENTITY_AUTH0.md`](../AGENT_IDENTITY_AUTH0.md) §2.1.
+
+## Evals and autoresearch
+
+Offline tests use a scripted fake model: they check the harness, not the model. **Scenario evals** check the agent with a real Bedrock model (Haiku by default), and run **on demand only**. See [`shared/evals/README.md`](shared/evals/README.md).
+
+- **One suite per category, e.g. [`generic-agents/evals/`](generic-agents/evals/):**
+  - scenario files in TOML that a non-developer can write;
+  - `dev` and `holdout` splits;
+  - code checks on replies and the audit log (tools called, approvals, no PII in audit, cost);
+  - an LLM judge only for rubrics.
+- **One runner for every variant.** It talks to the agent over the AgentCore contract, so the 8 variants can be compared on the same scenarios (`org-evals compare`).
+- **Autoresearch** ([`shared/evals/autoresearch/program.md`](shared/evals/autoresearch/program.md)): a Karpathy-style loop in which a coding agent:
+  - edits only one variant's system prompt;
+  - runs the dev evals, keeping improvements (with safety failures at 0) and reverting the rest;
+  - stops at a budget;
+  - checks the holdout split;
+  - opens a PR for human review.
+
+In production, AgentCore's managed evaluations (`agentcore run eval`, online evals, `agentcore run recommendation`) and A/B tests take over.
 
 ## Running offline
 

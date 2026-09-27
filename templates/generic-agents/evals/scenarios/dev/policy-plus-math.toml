@@ -1,0 +1,13 @@
+id = "policy-plus-math"
+description = "Look up a limit, then compute with it using the calculator."
+tags = ["knowledge", "math"]
+
+[[steps]]
+say = "What is the most I can claim for meals on a 4-day business trip?"
+as = "bob"
+expect = "completed"
+
+[expect]
+answer_includes = ["240"]
+tools_called = ["search_knowledge", "calculate"]
+max_usd = "0.08"

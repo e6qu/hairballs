@@ -8,3 +8,8 @@ __pycache__/
 .env
 .env.*
 *.db
+
+# evals and autoresearch scratch output
+results.tsv
+run.log
+holdout-*.log
