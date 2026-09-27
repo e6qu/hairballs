@@ -1,0 +1,54 @@
+"""Strands tool adapters over the shared generic tools (shell).
+
+The ``@tool`` signatures are the schema Strands shows the model (framework-required, so they live
+here). Each adapter passes the raw values straight to ``GenericTools``, which parses them into
+domain types. Principal and session come from ``invocation_state`` and are parsed too.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+from generic_tools.shell.service import TOOL_DESCRIPTIONS, GenericTools, ToolResult, ToolSuccess
+from org_agents.core.idempotency import idempotency_key
+from org_agents.domain import PrincipalId, SessionId, ToolName
+from org_agents.shell.fingerprint import fingerprint_arguments
+from strands import tool
+from strands.types.tools import AgentTool, ToolContext
+
+
+class ToolError(Exception):
+    """Raised so Strands reports an error tool result (status: error) back to the model."""
+
+
+def _out(result: ToolResult) -> str:
+    if isinstance(result, ToolSuccess):
+        return result.text
+    raise ToolError(result.text)
+
+
+def build_tools(service: GenericTools) -> list[AgentTool]:
+    @tool(name="calculate", description=TOOL_DESCRIPTIONS["calculate"])
+    def calculate(expression: str) -> str:
+        return _out(service.calculate({"expression": expression}))
+
+    @tool(name="search_knowledge", description=TOOL_DESCRIPTIONS["search_knowledge"])
+    def search_knowledge(query: str, max_results: int = 3) -> str:
+        return _out(service.search_knowledge({"query": query, "max_results": max_results}))
+
+    @tool(name="create_ticket", description=TOOL_DESCRIPTIONS["create_ticket"], context=True)
+    def create_ticket(
+        title: str, description: str, tool_context: ToolContext, priority: str = "normal"
+    ) -> str:
+        state: dict[str, Any] = tool_context.invocation_state
+        principal = PrincipalId.parse(state.get("principal"), "$.invocation_state.principal")
+        session = SessionId.parse(state.get("session"), "$.invocation_state.session")
+        args = {"title": title, "description": description, "priority": priority}
+        key = idempotency_key(session, ToolName("create_ticket"), fingerprint_arguments(args))
+        return _out(service.create_ticket(args, principal.value, key.value))
+
+    @tool(name="get_ticket", description=TOOL_DESCRIPTIONS["get_ticket"])
+    def get_ticket(ticket_id: str) -> str:
+        return _out(service.get_ticket({"ticket_id": ticket_id}))
+
+    return [calculate, search_knowledge, create_ticket, get_ticket]

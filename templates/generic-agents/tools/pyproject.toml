@@ -1,0 +1,39 @@
+[project]
+name = "generic-tools"
+version = "0.1.0"
+description = "Tools for the generic agent templates: domain, pure core, local backends, MCP server."
+requires-python = ">=3.12"
+dependencies = ["org-agents"]
+
+[project.optional-dependencies]
+mcp = ["mcp>=2.1"]
+
+[project.scripts]
+generic-tools-mcp = "generic_tools.shell.mcp_server:main"
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+org-agents = { path = "../../shared/python", editable = true }
+
+[tool.uv]
+exclude-newer = "2026-09-20T00:00:00Z"   # 7-day cooldown
+
+[dependency-groups]
+dev = ["mypy>=1.18", "pytest>=8", "ruff>=0.13"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
