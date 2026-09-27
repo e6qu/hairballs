@@ -7,6 +7,11 @@
 **Decisions taken:**
 - **2026-09-27: Platform commitment to AWS.** We accept being tied to AWS, Amazon Bedrock (models) and Bedrock AgentCore (agent platform). Portability to other clouds and model vendors is **not** a requirement. See §2 (R1, R11) and §10 (risk 8).
 **Research date:** 2026-09-26/27. Every version, count and date below is as of that date.
+**Companion documents:**
+- [`AGENTS_BUILDING_BLOCKS.md`](AGENTS_BUILDING_BLOCKS.md): the building blocks of an agent, and which frameworks, harnesses and AgentCore services provide each one.
+- [`AGENT_IDENTITY_AUTH0.md`](AGENT_IDENTITY_AUTH0.md): Auth0 with AgentCore Identity, Gateway and Policy.
+- [`AGENT_PI_BEDROCK.md`](AGENT_PI_BEDROCK.md): running pi autonomously on Bedrock and AgentCore.
+- [`AGENTS_OPENCODE_BEDROCK.md`](AGENTS_OPENCODE_BEDROCK.md): running opencode autonomously on Bedrock and AgentCore.
 
 ---
 
@@ -792,27 +797,113 @@ The design principle is therefore **make the safe path the easy path.**
 
 Strands' weak points are runaway defaults, the dependency set, experimental churn and CI hygiene. The wrapper and the supply-chain controls address them, and none of them is decisive. Pydantic AI is technically cleaner on dependencies and limits, but its release cadence, its thinner AgentCore integration and the lack of a no-code path make it the alternative, not the default.
 
-### 9.3 Reference architecture
+### 9.3 Reference architecture (current AgentCore)
 
+These diagrams target the **current** Amazon Bedrock AgentCore:
+- managed harness, Runtime, Gateway, Policy, Identity, Memory, Observability and Evaluations;
+- deployed with the `@aws/agentcore` CLI (`agentcore create / add / dev / deploy`, project config in `agentcore/agentcore.json`).
+
+They do **not** use the legacy Bedrock AgentCore Starter Toolkit (AWS samples keep that under `legacy/`) or Bedrock Agents Classic (maintenance mode since 2026-07-30).
+
+**Platform view:**
+
+```mermaid
+flowchart TB
+    subgraph CALLERS["Callers"]
+        USERS["Employees<br/>(chat UI, Auth0 SSO)"]
+        SVC["Schedulers / systems<br/>(Auth0 M2M)"]
+    end
+
+    A0["Auth0<br/>OIDC · M2M · OBO token exchange · CIBA"]
+
+    subgraph AC["Amazon Bedrock AgentCore (current)"]
+        direction TB
+        IDIN["Identity: inbound JWT authorizer<br/>(Auth0 discovery URL, audience/claims)<br/>→ Workload Access Token"]
+        subgraph HOST["Hosting"]
+            HAR["Managed harness (Tier 0)<br/>maxIterations 75 · timeoutSeconds 3600 · maxTokens"]
+            RUN["Runtime (Tier 1): microVM per session<br/>Strands + org-agents wrapper<br/>idle 15 min · maxLifetime ≤ 8 h"]
+        end
+        GW["Gateway (MCP)<br/>approved tool catalog"]
+        POL["Policy (Cedar)<br/>principal = Auth0 user / M2M client<br/>claims → tags · amounts · approvals"]
+        IDOUT["Identity: credential providers / Token Vault<br/>(Auth0Oauth2, OBO, client credentials, API keys)"]
+        MEM["Memory<br/>(short- and long-term)"]
+        OBS["Observability<br/>(OTel → CloudWatch / CloudTrail)"]
+        EV["Evaluations (online and batch)"]
+    end
+
+    BR["Amazon Bedrock<br/>application inference profile per agent (tagged)<br/>Guardrails · prompt caching"]
+    APIS["Internal APIs · Lambda · SaaS"]
+    FIN["AWS Budgets · Cost Anomaly Detection<br/>Service Quotas · kill switch"]
+
+    USERS --> A0
+    SVC --> A0
+    A0 -. "JWT" .-> IDIN
+    USERS -->|"Bearer JWT"| IDIN
+    SVC -->|"Bearer JWT"| IDIN
+    IDIN --> HAR
+    IDIN --> RUN
+    HAR --> BR
+    RUN --> BR
+    HAR --> GW
+    RUN --> GW
+    GW --> POL
+    GW --> IDOUT --> APIS
+    A0 -. "OBO / CIBA" .-> IDOUT
+    HAR --- MEM
+    RUN --- MEM
+    HAR -.-> OBS
+    RUN -.-> OBS
+    GW -.-> OBS
+    OBS --> EV
+    BR -.-> FIN
 ```
-                 ┌──────────────── Authors ────────────────┐
-                 │ Tier 0: config PR       Tier 1: template │
-                 └──────┬──────────────────────────┬────────┘
-                        │ policy lint, evals        │ CI: SBOM, osv/Inspector, provenance,
-                        ▼                           ▼     limit-lint, evals (CodeArtifact + cooldown)
-   ┌──────────────────────────────┐   ┌──────────────────────────────────────┐
-   │ AgentCore managed harness    │   │ AgentCore Runtime (microVM/session)  │
-   │ maxIterations / timeout /    │   │ Strands + org-agents wrapper         │
-   │ maxTokens                    │   │ limits, budget, loop-detect, HITL,   │
-   └──────────────┬───────────────┘   │ idempotency, thread policy, OTel     │
-                  │                   └───────────────────┬──────────────────┘
-                  └──────────────┬────────────────────────┘
-                                 ▼
-      Bedrock (application inference profile per agent/team, tagged; Guardrails; prompt caching)
-      AgentCore Gateway (approved MCP tools) ── AgentCore Policy (Cedar) ── Identity
-      AgentCore Memory / S3+KMS sessions (append-only)    Observability → CloudWatch / CloudTrail
-      AWS Budgets + Anomaly Detection per profile tag      Kill switch (flag + session termination)
+
+**Delivery view** (how Tier 0 configs and Tier 1 code reach AgentCore):
+
+```mermaid
+flowchart LR
+    T0["Tier 0: agent config PR<br/>(model, instructions, skills, tools)"] --> LINT
+    T1["Tier 1: org template<br/>(Strands + org-agents wrapper)"] --> LINT
+    LINT["Policy lint<br/>limits · HITL on mutating tools · approved tools"] --> SCAN["SBOM · osv-scanner / Inspector<br/>provenance · CodeArtifact cooldown"]
+    SCAN --> EVALS["AgentCore Evaluations<br/>regression suite"] --> DEPLOY["agentcore deploy<br/>(CodeBuild → CDK)"]
+    DEPLOY --> HAR["Managed harness (Tier 0)"]
+    DEPLOY --> RUN["Runtime (Tier 1)"]
 ```
+
+**Request view** (Tier 1, employee chat with a high-risk tool call):
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as Employee
+    participant A0 as Auth0
+    participant RT as AgentCore Runtime (Strands + org-agents)
+    participant BR as Bedrock
+    participant GW as Gateway + Policy (Cedar)
+    participant ID as AgentCore Identity (Token Vault)
+    participant API as Internal API
+    U->>A0: SSO (PKCE)
+    A0-->>U: access token
+    U->>RT: invoke (Bearer, session = thread)
+    RT->>RT: wrapper: budgets, turn limit, message-while-busy policy
+    loop agent turns
+        RT->>BR: Converse (cachePoint, guardrail)
+        BR-->>RT: tool call
+        RT->>GW: tools/call (user token)
+        GW->>GW: Cedar on sub, claims, input (e.g. amount)
+        alt high-risk
+            GW->>A0: CIBA approval (binding message, RAR)
+            A0-->>GW: approved token
+        end
+        GW->>ID: OBO / client-credentials token
+        ID-->>GW: downstream token
+        GW->>API: call (idempotency key)
+        API-->>RT: result
+    end
+    RT-->>U: answer + audit trail (OTel, CloudTrail)
+```
+
+Identity details are in [`AGENT_IDENTITY_AUTH0.md`](AGENT_IDENTITY_AUTH0.md).
 
 ---
 

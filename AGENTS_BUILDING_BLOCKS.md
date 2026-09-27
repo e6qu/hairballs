@@ -135,7 +135,7 @@ flowchart TB
 | 11 | Human approval | ✅ `interrupt()` + resume | ✅ "ask" gates | ✅ `interrupt()`, HITL middleware | ✅ `requires_approval`, deferred tools | ❌ (extension) | ✅ `ask` (interactive or over the API) | ✅ approvals (`smart` mode is the default) | ✅ harness inline function tools (return of control) |
 | 12 | Permission rules | 🟡 Cedar interventions | ✅ Cedar / ask | ❌ | ❌ | ❌ by design | ✅ allow / ask / deny with globs | 🟡 regex patterns plus an LLM "smart" check | ✅ **Policy (Cedar)** on every Gateway tool call |
 | 13 | Sandbox / isolation | ❌ | 🟡 programmatic tool-call sandbox | ❌ | ❌ | ❌ (run it in a container) | ❌ | 🟡 docker, modal, ssh and similar backends | ✅ **one microVM per session** |
-| 14 | Turn / iteration limit | 🟡 opt-in `limits.turns` | 🟡 | 🟡 default 10,007 | ✅ `request_limit=50` | ❌ | ✅ `steps` per agent | ❌ default unlimited | ✅ `maxIterations` = 75 |
+| 14 | Turn / iteration limit | 🟡 opt-in `limits.turns` | 🟡 | 🟡 default 10,007 | ✅ `request_limit=50` | ❌ | 🟡 `steps` per agent is **soft** (adds a 'max steps' prompt; tools stay available) | ❌ default unlimited | ✅ `maxIterations` = 75 |
 | 15 | Token / USD budget | 🟡 soft token limits | 🟡 | 🟡 call counts only | ✅ tokens + `cost_limit` | ❌ (extension; `pi-ai` tracks cost) | ❌ | ❌ | 🟡 `maxTokens`; USD through inference profiles and AWS Budgets |
 | 16 | Wall-clock timeout | 🟡 `cancel_signal`; Swarm 900 s | 🟡 | 🟡 | 🟡 per tool | ❌ | ❌ | 🟡 opt-in `run_budget_seconds` | ✅ `timeoutSeconds` = 3,600; idle 15 min; max lifetime 8 h |
 | 17 | Loop / stuck detection | 🟡 Swarm only | 🟡 | ❌ | ❌ | ❌ | ✅ doom loop (3 identical calls) | ✅ tool-loop guardrails, repetition guard | ❌ |
@@ -150,8 +150,8 @@ flowchart TB
 | 21 | Message arriving mid-run | ❌ throws (`ConcurrencyException`) | ❌ | 🟡 Server `multitask_strategy` | ✅ `enqueue(asap / when_idle)` | ✅ `steer` / `followUp` | ✅ joins at the next step | ✅ interrupt / queue / steer / redirect | 🟡 session-scoped invocations; the policy is yours |
 | 22 | Session persistence | ✅ file / S3 / repository | ✅ `./.agent/sessions` | ✅ checkpointers | ❌ bring your own | ✅ JSONL | ✅ SQLite | ✅ SQLite + FTS5 | ✅ Memory (short-term); the microVM filesystem persists across sessions |
 | 23 | Branch / fork / time travel | 🟡 snapshots | 🟡 | ✅ time travel | ❌ | ✅ tree, `/tree`, fork | ✅ fork, revert via git snapshots | unverified | ❌ |
-| 24 | Context compaction | ✅ sliding window / summarizing / auto | ✅ auto | ✅ middleware | 🟡 history processors | ✅ auto-summary | ✅ summary + prune | ✅ at 50% of the window | ✅ `sliding_window` / `summarization` |
-| 25 | Tool-output truncation | ✅ auto (preview over 1.5k tokens) | ✅ offloaded to storage | 🟡 context editing | ❌ | ✅ 2,000 lines / 50 KB | ✅ 2,000 lines / 50 KB, plus pruning | ✅ 50k characters | 🟡 unverified |
+| 24 | Context compaction | ✅ sliding window / summarizing / auto | ✅ auto | ✅ middleware | 🟡 history processors | ✅ auto-summary | ✅ auto-summary (`compaction.auto`) | ✅ at 50% of the window | ✅ `sliding_window` / `summarization` |
+| 25 | Tool-output truncation | ✅ auto (preview over 1.5k tokens) | ✅ offloaded to storage | 🟡 context editing | ❌ | ✅ 2,000 lines / 50 KB | ✅ 2,000 lines / 50 KB (`tool_output`); pruning opt-in (`compaction.prune`, default off) | ✅ 50k characters | 🟡 unverified |
 | 26 | Long-term memory | 🟡 memory tools, AgentCore Memory | ✅ markdown memory | ✅ Store | ❌ | ❌ | ❌ (AGENTS.md rules only) | ✅ MEMORY.md / USER.md plus providers (self-written) | ✅ **Memory** (long-term strategies) |
 | 27 | Prompt caching | 🟡 `CacheConfig` opt-in | ✅ on by default | 🟡 Anthropic middleware | 🟡 opt-in | ✅ automatic plus cache warmer | ✅ automatic (date in the system prompt resets it daily) | ✅ automatic | ❌ harness internals not published |
 | 28 | Skills / instruction files | 🟡 skills plugin | ✅ | ❌ | ❌ | ✅ skills, prompt templates, AGENTS.md | ✅ skills, rules, AGENTS.md | ✅ skills plus a remote hub | ✅ skills from Git, S3 or the AWS catalog |
@@ -181,7 +181,7 @@ Counts of ✅ out of 37 blocks (🟡 not counted), computed from the tables abov
 
 | | Strands | Strands H. | LangGraph | Pydantic AI | pi | opencode | Hermes | AgentCore |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| ✅ count | 20 | 25 | 15 | 19 | 17 | 22 | 24 | 24 |
+| ✅ count | 20 | 25 | 15 | 19 | 17 | 21 | 24 | 24 |
 
 **What the matrix shows:**
 - **Harnesses are strong on the agent's inner workings**: built-in tools, compaction, message handling while busy, sessions, caching and skills.
@@ -261,18 +261,19 @@ Semantics by system: pi `steer()` / `followUp()`; Claude Code and Codex inject m
 | **In-process embedding** | ✅ `@earendil-works/pi-coding-agent` SDK (`createAgentSession`), or `pi-agent-core` directly | 🟡 `@opencode-ai/sdk` is an HTTP client (`createOpencode()` starts a server) | 🟡 `run_agent.AIAgent` from a git checkout; no supported wheel |
 | **Permissions when unattended** | **None**: it never asks, so every enabled tool runs. Isolation must come from the container / VM | **Fail-closed by default**: `run` without `--auto` **auto-rejects** any `ask` permission (verified in `cli/cmd/run.ts`). `--auto` approves everything not explicitly denied | Unattended and cron runs **deny** approvals by default; interactive default is `smart` (an LLM auto-approves low-risk commands) |
 | **Tool restriction** | `--tools read,grep,find,ls`, `--no-tools`, `--no-extensions` | per-agent `permission` (allow / ask / deny, globs); tools can be denied | toolsets / config |
-| **Turn limit** | ❌ (write an extension) | ✅ `steps` per agent | ❌ default unlimited (`max_turns` configurable) |
+| **Turn limit** | ❌ (write an extension) | 🟡 `steps` per agent, **soft** (hard cap needs a plugin) | ❌ default unlimited (`max_turns` configurable) |
 | **Token / USD budget** | ❌ (extension; `pi-ai` reports usage and cost) | ❌ (plugin) | ❌ |
 | **Wall-clock limit** | ❌ in pi (use the process supervisor or AgentCore lifecycle) | ❌ (supervisor / AgentCore) | 🟡 `run_budget_seconds` (opt-in) |
 | **Loop detection** | ❌ | ✅ doom loop (3 identical calls → `ask`, which headless `run` rejects) | ✅ tool-loop hard stops (on by default when unattended) |
 | **Sessions when headless** | JSONL by default; `--no-session` for ephemeral runs; `--session-dir` | SQLite; `--continue` / `--session`, `--fork` | SQLite |
 | **Scheduling / triggers** | ❌ (external: EventBridge, cron, CI) | 🟡 GitHub Actions integration (`/opencode` comments) | ✅ built-in cron plus chat gateways |
+| **Bedrock credentials inside AgentCore Runtime** | needs help: pi doesn't detect instance-metadata credentials, so the adapter refreshes the environment (see `AGENT_PI_BEDROCK.md` §3.1) | needs help: the loader only enables the AWS credential chain when a profile or key is set, so use a `credential_process` profile (see `AGENTS_OPENCODE_BEDROCK.md` §3.1) | native boto3 chain |
 | **Provider lock-down** | `--provider` / `--model`; `--offline` | `enabled_providers` / `disabled_providers` in config | provider config |
 | **Supply-chain surface at runtime** | extensions and packages run in-process with full rights; `pi install` fetches from npm / git | npm plugins are installed at startup; the postinstall binary | Skills Hub remote installs; self-written skills |
 
 **Verdict:**
 - **Both pi and opencode can run headless and autonomously today.**
-- **opencode is safer out of the box when unattended.** Anything that would need approval is rejected, loop detection routes to that rejection, and it has per-agent step limits.
+- **opencode is safer out of the box when unattended.** Anything that would need approval is rejected, and loop detection routes to that rejection. Its per-agent `steps` limit is only a soft nudge; a hard cap needs the guard plugin.
 - **pi is the more embeddable and hackable.** Its RPC and SDK interfaces, steering, and cleaner loop make it the better base for our own controls. But it has no permission model, so it is only acceptable inside a sandbox (an AgentCore microVM) with tools restricted and a budget extension in place.
 - **Hermes** runs unattended well (cron, gateways). Its defaults and governance rule it out (see the scoping doc §4.8).
 
