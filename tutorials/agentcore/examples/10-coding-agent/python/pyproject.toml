@@ -1,0 +1,17 @@
+[project]
+name = "coder"
+version = "0.1.0"
+description = "A coding agent on AgentCore Runtime: persistent workspace, git via the token vault"
+requires-python = ">=3.12"
+dependencies = [
+    "bedrock-agentcore==1.23.1",
+    "boto3==1.43.103",
+    "strands-agents==1.57.1",
+    "strands-agents-tools==0.8.9",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[bedrock-agentcore]==1.43.103",
+    "mypy==2.3.1",
+]

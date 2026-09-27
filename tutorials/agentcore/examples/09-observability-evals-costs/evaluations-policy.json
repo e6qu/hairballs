@@ -1,0 +1,23 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["logs:DescribeLogGroups", "logs:StartQuery", "logs:GetQueryResults"],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"],
+      "Resource": "arn:aws:logs:eu-west-1:111122223333:log-group:/aws/bedrock-agentcore/evaluations/*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["logs:DescribeIndexPolicies", "logs:PutIndexPolicy"],
+      "Resource": [
+        "arn:aws:logs:eu-west-1:111122223333:log-group:aws/spans",
+        "arn:aws:logs:eu-west-1:111122223333:log-group:aws/spans:*"
+      ]
+    }
+  ]
+}

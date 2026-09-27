@@ -1,0 +1,18 @@
+[project]
+name = "helpdesk-auth0"
+version = "0.1.0"
+description = "The helpdesk agent behind an Auth0 JWT authorizer, calling an API with a vaulted token"
+requires-python = ">=3.12"
+dependencies = [
+    "bedrock-agentcore==1.23.1",
+    "httpx==0.28.1",
+    "strands-agents==1.57.1",
+]
+
+[dependency-groups]
+dev = [
+    "mypy==2.3.1",
+]
+
+[tool.ruff]
+line-length = 100

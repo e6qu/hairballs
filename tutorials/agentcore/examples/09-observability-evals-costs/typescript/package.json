@@ -1,0 +1,21 @@
+{
+  "name": "helpdesk-observability",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "usage": "node dist/usage.js",
+    "evaluate": "node dist/evaluate.js"
+  },
+  "dependencies": {
+    "@aws-sdk/client-bedrock-agentcore": "3.1141.0",
+    "@aws-sdk/client-bedrock-agentcore-control": "3.1141.0",
+    "@aws-sdk/client-cloudwatch-logs": "3.1141.0"
+  },
+  "devDependencies": {
+    "@smithy/types": "4.19.0",
+    "@types/node": "22.20.4",
+    "typescript": "5.9.3"
+  }
+}
