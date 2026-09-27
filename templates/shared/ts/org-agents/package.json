@@ -1,0 +1,25 @@
+{
+  "name": "@org/agents",
+  "version": "0.1.0",
+  "description": "Shared agent controls for TypeScript agents: domain types, parsers, guard (limits, budget, loop detection), tool policy, message/thread policy, redaction, audit, idempotency, MCP client and AgentCore Runtime HTTP server.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "exports": {
+    ".": "./src/index.ts",
+    "./*": "./src/*.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "smol-toml": "1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "6.0.3"
+  }
+}

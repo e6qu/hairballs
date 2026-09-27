@@ -53,7 +53,15 @@ class Stopped:
     text: str
 
 
-RunOutcome = Completed | ApprovalNeeded | Stopped
+@dataclass(frozen=True, slots=True)
+class Failed:
+    """The framework or model provider raised (throttling, validation, network...).
+    The thread must return to idle so later messages are answered."""
+
+    error: str
+
+
+RunOutcome = Completed | ApprovalNeeded | Stopped | Failed
 
 
 # ---------------------------------------------------------------- replies (core → shell)
@@ -95,4 +103,9 @@ class Refused:
     reason: str
 
 
-Reply = Answer | ApprovalRequested | RunHalted | Acknowledged | Refused
+@dataclass(frozen=True, slots=True)
+class RunFailed:
+    error: str
+
+
+Reply = Answer | ApprovalRequested | RunHalted | RunFailed | Acknowledged | Refused

@@ -12,9 +12,11 @@ from dataclasses import dataclass
 
 from org_agents.core.guard import (
     Continue,
+    ExternalStopObserved,
     GuardState,
     KillSwitchObserved,
     ModelCallCompleted,
+    StopReason,
     StopRun,
     ToolRequested,
     TurnStarted,
@@ -24,6 +26,7 @@ from org_agents.core.tool_policy import Allowed, Denied, NeedsApproval, decide_t
 from org_agents.domain import Limits, ModelPrice, SessionId, ToolName, ToolPolicy, Usage
 from org_agents.shell.audit import (
     AuditSink,
+    RunFailedEvent,
     RunFinishedEvent,
     RunStartedEvent,
     RunStoppedEvent,
@@ -126,6 +129,21 @@ class RunGuard:
             case _:
                 self._audit.emit(ToolDecisionEvent(self._session, tool, "allowed", "", now))
                 return Proceed()
+
+    def record_external_stop(self, reason: StopReason, detail: str) -> StopRun:
+        """Record a stop decided outside the guard (cancel, framework limit) so state and audit agree."""
+        was_stopped = self._state.stopped is not None
+        event = ExternalStopObserved(reason, detail, self._clock.now())
+        self._state, decision = step(self._state, event, self._limits, self._price)
+        self._apply(decision, was_stopped)
+        return self._state.stopped or StopRun(reason, detail)
+
+    def record_external_usage(self, usage: Usage) -> Continue | StopRun:
+        """Usage from model calls made outside the agent loop (e.g. a context summarizer)."""
+        return self.after_model_call(usage)
+
+    def fail(self, error: str) -> None:
+        self._audit.emit(RunFailedEvent(self._session, error, self._clock.now()))
 
     def finish(self) -> None:
         self._audit.emit(

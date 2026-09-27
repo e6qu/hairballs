@@ -11,7 +11,9 @@ from org_agents.conversation import (
     ApprovalPolicy,
     ApprovalRequested,
     Completed,
+    Failed,
     Reply,
+    RunFailed,
     RunHalted,
     RunOutcome,
     Stopped,
@@ -19,6 +21,7 @@ from org_agents.conversation import (
 from org_agents.core.messages import (
     AwaitingApproval,
     BusyPolicy,
+    CancelRun,
     DeliverApproval,
     Idle,
     Incoming,
@@ -58,6 +61,11 @@ def receive(state: ThreadState, message: Incoming, busy: BusyPolicy) -> tuple[Th
         case QueueFollowUp(prompt=prompt):
             queued = QueuedPrompt(message.sender, prompt)
             return replace(state, follow_ups=(*state.follow_ups, queued)), action
+        case CancelRun():
+            # A pending approval is abandoned on cancel; a running run stays Running until it stops.
+            if isinstance(state.status, AwaitingApproval):
+                return replace(state, status=Idle()), action
+            return state, action
         case DeliverApproval():
             match state.status:
                 case AwaitingApproval(owner=owner):
@@ -81,6 +89,9 @@ def finish(
         case Stopped(stop=stop, text=text):
             # A stopped run also drops queued follow-ups: limits apply to the thread's work, not one prompt.
             return replace(state, status=Idle(), follow_ups=()), RunHalted(stop, text)
+        case Failed(error=error):
+            # Keep queued follow-ups: the failure belongs to this run, not to later messages.
+            return replace(state, status=Idle()), RunFailed(error)
 
 
 def next_follow_up(state: ThreadState) -> tuple[ThreadState, QueuedPrompt | None]:

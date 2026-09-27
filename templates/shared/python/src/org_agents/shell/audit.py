@@ -49,7 +49,32 @@ class RunFinishedEvent:
     at: Instant
 
 
-AuditEvent = RunStartedEvent | ToolDecisionEvent | UsageEvent | RunStoppedEvent | RunFinishedEvent
+@dataclass(frozen=True, slots=True)
+class RunFailedEvent:
+    session: SessionId
+    error: str
+    at: Instant
+
+
+@dataclass(frozen=True, slots=True)
+class ContextCompactedEvent:
+    """History was trimmed or summarized (the pre-compaction transcript should be kept elsewhere)."""
+
+    session: SessionId
+    messages_before: int
+    messages_after: int
+    at: Instant
+
+
+AuditEvent = (
+    RunStartedEvent
+    | ToolDecisionEvent
+    | UsageEvent
+    | RunStoppedEvent
+    | RunFinishedEvent
+    | RunFailedEvent
+    | ContextCompactedEvent
+)
 
 
 def render(event: AuditEvent) -> dict[str, object]:
@@ -74,6 +99,10 @@ def render(event: AuditEvent) -> dict[str, object]:
             return {**base, "type": "run_stopped", "reason": stop.reason.value, "detail": stop.detail}
         case RunFinishedEvent(turns=turns, spent=spent):
             return {**base, "type": "run_finished", "turns": turns, "run_usd": str(spent.amount)}
+        case RunFailedEvent(error=error):
+            return {**base, "type": "run_failed", "error": error}
+        case ContextCompactedEvent(messages_before=before, messages_after=after):
+            return {**base, "type": "context_compacted", "messages_before": before, "messages_after": after}
 
 
 class AuditSink(Protocol):

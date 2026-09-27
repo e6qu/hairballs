@@ -93,3 +93,17 @@ def test_parse_incoming_variants() -> None:
     )
     with pytest.raises(ParseError):
         parse_incoming({"prompt": 3}, who)
+
+
+def test_external_stop_and_failure_are_audited() -> None:
+    from org_agents.shell.audit import RunFailedEvent
+
+    cfg = parse_agent_config(CONFIG, {})
+    audit = MemoryAuditSink()
+    guard = RunGuard(SessionId("s1"), cfg.limits, cfg.price, cfg.tools, FakeClock(), audit)
+    stop = guard.record_external_stop(StopReason.CANCELLED, "cancelled by owner")
+    assert stop.reason is StopReason.CANCELLED and guard.stopped == stop
+    assert isinstance(guard.before_model_call(), StopRun)  # sticky
+    guard.fail("boom")
+    assert any(isinstance(e, RunFailedEvent) for e in audit.events)
+    assert sum(isinstance(e, RunStoppedEvent) for e in audit.events) == 1

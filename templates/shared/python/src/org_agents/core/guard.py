@@ -32,6 +32,8 @@ class StopReason(enum.Enum):
     TOOL_CALL_LIMIT = "tool_call_limit"
     LOOP_DETECTED = "loop_detected"
     KILL_SWITCH = "kill_switch"
+    CANCELLED = "cancelled"
+    FRAMEWORK_LIMIT = "framework_limit"  # a framework-side limit fired (e.g. recursion / usage limit)
 
 
 # ---------------------------------------------------------------- events
@@ -60,7 +62,16 @@ class KillSwitchObserved:
     at: Instant
 
 
-GuardEvent = TurnStarted | ModelCallCompleted | ToolRequested | KillSwitchObserved
+@dataclass(frozen=True, slots=True)
+class ExternalStopObserved:
+    """A stop decided outside the guard: user cancel, or a framework-side limit (recursion/usage)."""
+
+    reason: StopReason
+    detail: str
+    at: Instant
+
+
+GuardEvent = TurnStarted | ModelCallCompleted | ToolRequested | KillSwitchObserved | ExternalStopObserved
 
 
 # ---------------------------------------------------------------- decisions
@@ -134,6 +145,9 @@ def step(
     match event:
         case KillSwitchObserved():
             return _stop(state, StopReason.KILL_SWITCH, "kill switch is on")
+
+        case ExternalStopObserved(reason=reason, detail=detail):
+            return _stop(state, reason, detail)
 
         case TurnStarted(at=at):
             turns = state.turns + 1

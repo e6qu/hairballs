@@ -33,3 +33,24 @@ def test_approval_excludes_requester_under_four_eyes() -> None:
     s, reply = finish(s, ApprovalNeeded(ApprovalId("ap"), ToolName("create_ticket"), "x"), ALICE, POLICY)
     assert isinstance(reply, ApprovalRequested) and reply.approvers == frozenset({LEAD})
     assert isinstance(s.status, AwaitingApproval)
+
+
+def test_failed_run_returns_thread_to_idle() -> None:
+    from org_agents.conversation import Failed, RunFailed
+
+    s = ThreadState.initial()
+    s, _ = receive(s, ChatMessage(MessageId("1"), ALICE, Prompt("a")), BusyPolicy.STEER)
+    s, reply = finish(s, Failed("ThrottlingException"), ALICE, POLICY)
+    assert reply == RunFailed("ThrottlingException") and s.status == Idle()
+    s, _ = receive(s, ChatMessage(MessageId("2"), ALICE, Prompt("b")), BusyPolicy.STEER)
+    assert s.status == Running(ALICE)  # later messages start a new run instead of being steered forever
+
+
+def test_cancel_while_awaiting_approval_goes_idle() -> None:
+    from org_agents.core.messages import CancelRequest, CancelRun
+
+    s = ThreadState.initial()
+    s, _ = receive(s, ChatMessage(MessageId("1"), ALICE, Prompt("a")), BusyPolicy.STEER)
+    s, _ = finish(s, ApprovalNeeded(ApprovalId("ap"), ToolName("create_ticket"), "x"), ALICE, POLICY)
+    s, action = receive(s, CancelRequest(MessageId("2"), ALICE), BusyPolicy.STEER)
+    assert action == CancelRun() and s.status == Idle()
