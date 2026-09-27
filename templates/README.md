@@ -57,6 +57,22 @@ The category `tools/` package is a single implementation with two faces:
 - **in-process** for the Python frameworks;
 - an **MCP server** for the TypeScript harnesses, and for deployment as an **AgentCore Gateway** target in production.
 
+## Caller identity (all variants)
+
+Each request carries an Auth0 access token. The token is validated by AgentCore Runtime and parsed at the boundary into a `Caller`:
+- **`HumanUser`:**
+  - a required email;
+  - optional given and family names;
+  - a stable `UserId` taken from a claim, remembered per `sub`, or minted, so people can change their email or name.
+- **`ServiceClient`:** machine-to-machine callers.
+
+The Auth0 `sub` stays the authorization key. The profile is used for:
+- the ticket requester;
+- approval replies (`requester`);
+- a first-name preamble in the first user message from each speaker.
+
+It never goes into the system prompt or audit logs. Setup, including the Auth0 post-login Action, is in [`../AGENT_IDENTITY_AUTH0.md`](../AGENT_IDENTITY_AUTH0.md) §2.1.
+
 ## Running offline
 
 ```bash

@@ -93,6 +93,57 @@ agentcore add gateway --name tools_gw --authorizer-type CUSTOM_JWT \
 - Custom containers (pi, opencode) read these headers themselves on `/invocations`.
 - **Don't use `X-Amzn-Bedrock-AgentCore-Runtime-User-Id` in production.** It exists only on the SigV4 path and AWS says its value is not verified.
 
+### 2.1 User profile in the access token: user id, email and names
+
+Every human user has an Auth0 identity (`sub`), a **required** email address, and **optional** first and last names. They may also have an org **user id**. The templates keep two identifiers apart:
+
+| Identifier | Source | Used for |
+|---|---|---|
+| `PrincipalId` = Auth0 `sub` | always in the token | authorization: thread ownership, four-eyes approvals, Cedar `OAuthUser` |
+| `UserId` (e.g. `usr_…`) | `<ns>user_id` claim if present; else remembered per `sub`; else minted once | business records (ticket requester). It stays the same when the user changes email or name. |
+
+Access tokens don't carry `email` or name claims by default. A post-login Action adds them as **namespaced** custom claims. It can also mint the user id once and keep it in `app_metadata`:
+
+```javascript
+// Auth0 post-login Action: profile claims for agent APIs.
+const NS = "https://fintech.example/";
+
+exports.onExecutePostLogin = async (event, api) => {
+  if (!event.user.email || !event.user.email_verified) {
+    api.access.deny("a verified email address is required");
+    return;
+  }
+  let userId = event.user.app_metadata?.user_id;
+  if (!userId) {
+    userId = `usr_${require("crypto").randomUUID().replaceAll("-", "")}`;
+    api.user.setAppMetadata("user_id", userId); // minted once; survives email and name changes
+  }
+  api.accessToken.setCustomClaim(`${NS}user_id`, userId);
+  api.accessToken.setCustomClaim(`${NS}email`, event.user.email);
+  if (event.user.given_name) api.accessToken.setCustomClaim(`${NS}given_name`, event.user.given_name);
+  if (event.user.family_name) api.accessToken.setCustomClaim(`${NS}family_name`, event.user.family_name);
+};
+```
+
+How the templates handle this (`org_agents.identity` / `@org/agents`):
+- **Parse the claims.** The claims are parsed into `HumanUser(user_id, subject, email, given_name?, family_name?)` or `ServiceClient(subject)`.
+  - A `sub` ending in `@clients` or `gty = client-credentials` is a service client, with no profile.
+  - A human token without an email claim is refused (`invalid_request`).
+  - Standard `email` / `given_name` / `family_name` claims are fallbacks.
+  - The namespace is set in `[identity].claim_namespace`.
+- **Resolve the user id** in this order: the token claim, then the id remembered for the `sub` (the `UserDirectory`; SQLite locally, DynamoDB keyed by `sub` in production), then a newly minted id. The profile always comes from the latest token, so email and name changes show up at once.
+- **Where PII is allowed:**
+  - the ticket requester (`Name <email> (user id)`);
+  - approval requests (`requester` in the `approval_required` reply);
+  - the model context. Only the first name goes there, as `[Context: you are assisting <first name>.]` at the start of the first user message from each speaker. It is never in the system prompt, so the prompt cache stays shared across users.
+- **Audit logs** record only `sub` and ids, never email or names.
+- **Tool arguments:** the harness, not the model, sets `requester_id` / `requester_name` / `requester_email` on side-effecting tools. When the Action mints the id, a Gateway Cedar policy can also bind them to the token:
+  ```cedar
+  forbid(principal, action == AgentCore::Action::"Tickets___create_ticket", resource)
+  unless { principal.hasTag("https://fintech.example/user_id") &&
+           context.input.requester_id == principal.getTag("https://fintech.example/user_id") };
+  ```
+
 ---
 
 ## 3. Outbound: credential providers (Token Vault)
