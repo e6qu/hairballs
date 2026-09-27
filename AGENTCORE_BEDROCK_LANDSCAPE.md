@@ -39,7 +39,7 @@ Each AgentCore part can be used on its own, from any framework and with any mode
 | **Runtime** | Serverless hosting for *your* agent code. Every conversation gets its own isolated microVM that lives up to 8 hours | Lambda crossed with Fargate, built for long, stateful, streaming agent sessions. It is a host, **not** an agent |
 | **Harness** | A **managed agent loop**: you declare model, prompt, tools, skills and memory, and AWS runs the loop inside Runtime | The closest thing to a **managed, remote Claude Code**: a configured agent with a shell, a filesystem and skills, running in a cloud sandbox |
 | **Gateway** | One governed endpoint that turns APIs, Lambdas and MCP servers into MCP tools. It can also front other agents and LLMs | An API gateway for tools (and models) that speaks MCP |
-| **Identity** | Identities for agents plus a token vault, so agents act for users or as themselves without holding secrets | Okta for workloads, plus a secrets broker for OAuth tokens |
+| **Identity** | Identities for agents plus a token vault, so agents act for users or as themselves without holding secrets. Users still sign in with **Auth0**; AgentCore validates the Auth0 token | Auth0 for workloads, plus a secrets broker for OAuth tokens |
 | **Policy** | Cedar rules checked on every tool call at the Gateway, with Bedrock Guardrails inside | An authorization firewall (like OPA or AWS Verified Permissions) for agent actions |
 | **Memory** | Managed short-term conversation history plus long-term extracted memories | A managed conversation store with a "facts about the user" index |
 | **Code Interpreter / Browser** | Managed sandboxes for running code and driving a headless browser | A hosted Jupyter/shell sandbox, and a hosted Chrome under Playwright |
@@ -240,12 +240,23 @@ Classic still does a few things the harness does not:
 
 **Price.** Free when used through Runtime or Gateway.
 
-**Our take.** The identity model is in `AGENT_IDENTITY_AUTH0.md` and in the templates' `Caller` types:
-- Auth0 `sub` is the authorization key.
-- The org user id is the business key.
-- Service clients get their own identity.
+**With Auth0, concretely.** Auth0 tenant `fintech.eu.auth0.com`, agents API `https://agents.fintech.example`. The full setup is in [`AGENT_IDENTITY_AUTH0.md`](AGENT_IDENTITY_AUTH0.md).
 
-Adopt OBO and Private Key JWT, and put the consent portal in front of third-party OAuth tools.
+| Job | Auth0 side | AgentCore side |
+|---|---|---|
+| **Users sign in** | Web/SPA application with Authorization Code + PKCE, `audience=https://agents.fintech.example`. A post-login Action adds `https://fintech.example/email`, `given_name`, `family_name` and `user_id` claims, plus roles as namespaced string claims | Runtime or Gateway `customJWTAuthorizer`: discovery URL `https://fintech.eu.auth0.com/.well-known/openid-configuration`, **`allowedAudience`** = the agents API. Use the audience rather than `allowedClients`, because Auth0 access tokens carry `azp`, not `client_id` |
+| **Automation signs in** | An M2M application per workload (e.g. `agent-scheduler`) using client credentials, authorized for the agents API with narrow scopes. Tokens have `sub = <client_id>@clients` | Same authorizer. Our templates parse it as a `ServiceClient` with no profile |
+| **Agent calls an internal API as the user** | Enable on-behalf-of token exchange (RFC 8693) on the downstream API, e.g. `https://payments.fintech.example` | Credential provider `CustomOauth2` with `onBehalfOfTokenExchangeConfig`. The built-in `Auth0Oauth2` vendor has no OBO settings. **[verify in PoC]**: the tenant must have the feature enabled |
+| **Agent calls an API as itself** | An M2M application for the agent | Credential provider `Auth0Oauth2` (client credentials). **Private Key JWT** authenticates to Auth0 with a KMS-held key, so no client secret |
+| **Agent calls SaaS as the user** (e.g. Google Drive) | – (the SaaS is its own IdP) | 3LO credential provider plus the **consent portal**, bound to the Auth0 user |
+| **High-risk approval** | **CIBA** with Rich Authorization Requests: a Guardian push to the approver | A Gateway tool that waits for the CIBA result; the downstream API verifies the approved details |
+
+**Our take.** The templates already implement the caller side (`Caller` types):
+- Auth0 `sub` is the authorization key.
+- The org user id (the `user_id` claim, or remembered or minted) is the business key.
+- M2M clients are `ServiceClient`.
+
+Next: adopt OBO and Private Key JWT, and put the consent portal in front of third-party OAuth tools.
 
 ### 2.6 Policy: Cedar authorization on every tool call
 
@@ -263,7 +274,23 @@ A call is allowed only if a **Cedar** policy permits it. Features:
 
 Policy went GA on 2026-03-03 and runs in all 22 regions. It costs $0.000025 per authorization.
 
-**Our take.** Encode tool permissions and amount limits as Cedar policies ("treasury role may transfer < 10k"). Start in LOG_ONLY mode, then switch to ENFORCE. This complements our in-process tool policy; it does not replace it.
+**With Auth0 claims.** Every claim in the Auth0 access token becomes a tag on the Cedar principal. The post-login Action should therefore emit roles as a **namespaced string claim** (e.g. `https://fintech.example/role`). How array claims such as `permissions` serialize into tags is **[verify in PoC]**.
+
+```cedar
+// Only Auth0 users with the treasury role may call transfer, and only below 10k.
+permit(principal, action == AgentCore::Action::"Payments___transfer", resource)
+when {
+  principal.hasTag("https://fintech.example/role") &&
+  principal.getTag("https://fintech.example/role") == "treasury" &&
+  context.input.amount < 10000
+};
+
+// M2M clients (scheduled or event runs) may never create tickets.
+forbid(principal, action == AgentCore::Action::"Tickets___create_ticket", resource)
+when { principal.hasTag("gty") && principal.getTag("gty") == "client-credentials" };
+```
+
+**Our take.** Encode tool permissions and amount limits as Cedar policies on Auth0 claims. Start in LOG_ONLY mode, then switch to ENFORCE. This complements our in-process tool policy; it does not replace it.
 
 ### 2.7 Memory
 
@@ -646,17 +673,20 @@ flowchart TB
 
 ### 5.3 Identities: who is who
 
-| Identity | Issued by | Used for | In our code |
-|---|---|---|---|
-| **User** | Auth0 (OIDC). The post-login Action adds `<ns>email`, names and `<ns>user_id` | Authorization (`sub`), approvals, per-user rate limits and document ACLs | `HumanUser` (email required, stable `UserId`) |
-| **Service client** (automation) | Auth0 client credentials (`<client>@clients`) | Scheduled and event runs that act **as a system**, not as a person | `ServiceClient` |
-| **Agent** | AgentCore workload identity (automatic per Runtime, harness or Gateway) | Getting downstream tokens from the token vault, and tagging the agent in traces and costs | Runtime execution role plus workload identity |
-| **Agent acting for a user** | Identity **OBO token exchange** (RFC 8693), or 3LO via the consent portal | Calling downstream APIs *as the user*, with the user's permissions | `WorkloadAccessToken`, forwarded to tools |
-| **Approver** | Auth0 user with an approver role | Four-eyes approvals | `ApprovalPolicy` in each template |
+| Identity | Auth0 example | What the token looks like | Used for | In our code |
+|---|---|---|---|---|
+| **User** | User `alice@fintech.example` signs in to the **Agent Portal** application (Authorization Code + PKCE, `audience=https://agents.fintech.example`). The post-login Action adds the profile claims | `sub=auth0\|64f0…`, `https://fintech.example/email`, `…/given_name`, `…/user_id=usr_…`, `…/role=analyst` | Authorization (`sub`), per-user rate limits (Gateway, keyed by `sub`), document ACLs (`userContext.userId` = our user id) | `HumanUser` (email required, stable `UserId`) |
+| **Agent author / publisher** | The same user, with the Auth0 role `agent-publisher` | `…/role=agent-publisher` | Creating agents in the portal and submitting them to the Registry. Publishing requires a second person with `agent-approver` | Portal authorization |
+| **Service client** (automation) | M2M application `agent-scheduler` (client credentials, scope `agents:invoke`) | `sub=<client_id>@clients`, `gty=client-credentials`, no profile | Scheduled and event runs that act **as a system** | `ServiceClient` |
+| **Agent** | – (AWS side) | Workload identity per Runtime, harness or Gateway; workload access token bound to agent plus user | Getting downstream tokens from the token vault; the agent's name in traces, costs and the Registry | Runtime execution role plus workload identity |
+| **Agent acting for a user** | Auth0 **on-behalf-of token exchange** to `https://payments.fintech.example` with narrower scopes | New access token: same `sub` (Alice), audience = payments API, `act` = the agent **[verify claim shape]** | Calling downstream APIs *as Alice*, with Alice's permissions | `WorkloadAccessToken`, forwarded to tools |
+| **Approver** | User with the Auth0 role `service-desk-lead`, approving in the chat, or on their phone through **CIBA** (Guardian push) for high-risk actions | `sub=auth0\|service-desk-lead…` | Four-eyes approvals | `ApprovalPolicy` in each template |
 
 **Rules:**
-- A scheduled or event-driven agent runs as a **service client** unless the trigger carries a user. In that case it uses OBO, never a stored user token.
+- A scheduled or event-driven agent runs as a **service client** (an Auth0 M2M application) unless the trigger carries a user. In that case it uses OBO, never a stored user token.
+- Each automation workload gets **its own M2M application**, so the Auth0 logs and our audit show which schedule or event source acted.
 - The agent never holds client secrets. It uses Private Key JWT (KMS) and the token vault.
+- Roles, and the approver lists in each agent's config, are managed in Auth0. Offboarding a user in Auth0 removes access to every agent at once.
 - **PII** (email, names) may appear in ticket requester fields, approval requests and the first-name greeting. It never appears in audit logs.
 
 ### 5.4 Four ways to run an agent
@@ -664,12 +694,12 @@ flowchart TB
 | Mode | Path | Session | Notes |
 |---|---|---|---|
 | **Live prompt** (chat UI, IDE) | Client → Auth0 login → Gateway (JWT) → Runtime; streamed over SSE/WebSocket/AG-UI | One session per conversation thread | Steering, queuing, cancel and approvals are handled by our thread state machine |
-| **Chat-platform message** (Slack, Teams) | Bot → verify the platform's signature → map the chat user to their Auth0 user → Gateway → Runtime | One session per chat thread | Reply asynchronously for long runs; approvals come back as buttons |
+| **Chat-platform message** (Slack, Teams) | Bot → verify the platform's signature → map the chat user to their Auth0 user → Gateway → Runtime | One session per chat thread | The user links their chat account to Auth0 once (Auth0 login from the bot). The bot then gets an Auth0 token for that user, e.g. with Auth0 Custom Token Exchange **[verify]**, and never acts with a shared token. Reply asynchronously for long runs; approvals come back as buttons |
 | **Event** | EventBridge rule → **Step Functions** → Gateway (M2M JWT) → Runtime, or the native **harness step** | A fresh session per event (idempotent session id = event id) | Retries, timeouts and human approvals (task token) in Step Functions; the dead-letter queue is observable |
 | **Schedule** | **EventBridge Scheduler** (cron/rate) → Step Functions → as for events | A fresh session per run | AgentCore has no built-in scheduler. Scheduler plus Step Functions is the AWS-native pattern |
 
 **Inbound authentication for automation.** A Runtime accepts JWT or IAM, not both.
-- **Option 1: keep one JWT door.** Step Functions gets an Auth0 M2M token (a Lambda step) and calls through the Gateway.
+- **Option 1: keep one JWT door.** A Lambda step gets an Auth0 M2M token (`POST https://fintech.eu.auth0.com/oauth/token`, `grant_type=client_credentials`, `audience=https://agents.fintech.example`) and calls through the Gateway. It caches the token until expiry, because Auth0 rate-limits and meters M2M tokens. The client secret or private key lives in Secrets Manager or KMS.
 - **Option 2: harness plus native Step Functions integration.** This uses IAM, so the harness endpoint is IAM-authenticated and separate from the user-facing door.
 
 **[verify in PoC]:** whether EventBridge Scheduler's universal targets or Step Functions' SDK integrations can call `InvokeAgentRuntime` directly.
