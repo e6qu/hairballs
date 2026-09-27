@@ -1,0 +1,19 @@
+[project]
+name = "helpdesk-tools"
+version = "0.1.0"
+description = "A Lambda tool behind an AgentCore Gateway, and a client that calls the gateway"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3==1.43.103",
+    "httpx2==2.13.1",
+    "mcp==2.2.0",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs==1.43.103",
+    "mypy==2.3.1",
+]
+
+[tool.ruff]
+line-length = 100

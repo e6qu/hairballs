@@ -3,6 +3,7 @@
 Ten short tutorials. Each teaches one thing and builds on the one before. The running example is **helpdesk**, an internal assistant for expense and IT questions that can open tickets.
 
 Every tutorial shows:
+
 - the **`agentcore` CLI** where it is the simplest path;
 - **application code** side by side, **Python | TypeScript**;
 - **infrastructure** side by side, **AWS CLI | Terraform**.

@@ -1,0 +1,17 @@
+[project]
+name = "helpdesk-client"
+version = "0.1.0"
+description = "Invoke the deployed helpdesk harness"
+requires-python = ">=3.12"
+dependencies = [
+    "boto3==1.43.103",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[bedrock-agentcore]==1.43.103",
+    "mypy==2.3.1",
+]
+
+[tool.ruff]
+line-length = 100

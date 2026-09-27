@@ -235,11 +235,9 @@ aws bedrock-agentcore-control create-harness \
   --skills '[{"s3":{"uri":"s3://fintech-agent-skills/expense-policy/"}}]' \
   --max-iterations 20 --max-tokens 200000
 
-aws bedrock-agentcore invoke-harness \
-  --harness-arn arn:aws:bedrock-agentcore:eu-west-1:111122223333:harness/helpdesk-… \
-  --runtime-session-id "$SID" \
-  --messages '[{"role":"user","content":[{"text":"How much can I claim for meals on a 4-day trip?"}]}]'
 ```
+
+To prompt it, use an SDK (`invoke_harness` in boto3, `InvokeHarnessCommand` in the JavaScript SDK) or `agentcore invoke`. The AWS CLI has **no** `invoke-harness` command: it leaves out operations that stream their answer, and `invoke-agent-runtime-command` and `invoke-code-interpreter` are missing for the same reason.
 
 Most of these fields (model, prompt, tools, skills, limits) can also be **overridden per invocation**.
 
@@ -373,14 +371,14 @@ AgentCore has two APIs:
 
 | Piece | `agentcore` CLI | CloudFormation (`AWS::BedrockAgentCore::…`) | AWS CLI: create / use | Terraform `hashicorp/aws` 6.66 | Terraform `hashicorp/awscc` 1.103 |
 |---|---|---|---|---|---|
-| Harness | `add harness`, `add tool`, `add skill` | `Harness`, `HarnessEndpoint` | `create-harness` / `invoke-harness` | `aws_bedrockagentcore_harness` | `awscc_bedrockagentcore_harness`, `…_harness_endpoint` |
-| Code agent (Runtime) | `create --framework …` | `Runtime`, `RuntimeEndpoint` | `create-agent-runtime`, `create-agent-runtime-endpoint` / `invoke-agent-runtime`, `invoke-agent-runtime-command` | `aws_bedrockagentcore_agent_runtime`, `…_agent_runtime_endpoint` | `awscc_bedrockagentcore_runtime`, `…_runtime_endpoint` |
+| Harness | `add harness`, `add tool`, `add skill` | `Harness`, `HarnessEndpoint` | `create-harness` / (SDK only: `InvokeHarness`) | `aws_bedrockagentcore_harness` | `awscc_bedrockagentcore_harness`, `…_harness_endpoint` |
+| Code agent (Runtime) | `create --framework …` | `Runtime`, `RuntimeEndpoint` | `create-agent-runtime`, `create-agent-runtime-endpoint` / `invoke-agent-runtime` (SDK only: `InvokeAgentRuntimeCommand`) | `aws_bedrockagentcore_agent_runtime`, `…_agent_runtime_endpoint` | `awscc_bedrockagentcore_runtime`, `…_runtime_endpoint` |
 | Gateway + tools | `add gateway`, `add gateway-target` | `Gateway`, `GatewayTarget`, `GatewayRule`, `GatewayRateLimit` | `create-gateway`, `create-gateway-target`, `create-gateway-rule`, `create-gateway-rate-limit` / (agents call it over MCP HTTP) | `aws_bedrockagentcore_gateway`, `…_gateway_target`, `…_gateway_rule` | `awscc_bedrockagentcore_gateway`, `…_gateway_rule`, `…_gateway_rate_limit` |
 | Credentials (token vault) | `add credential` | `OAuth2CredentialProvider`, `ApiKeyCredentialProvider` | `create-oauth2-credential-provider`, `create-api-key-credential-provider` | `aws_bedrockagentcore_oauth2_credential_provider`, `…_api_key_credential_provider` | `awscc_bedrockagentcore_o_auth_2_credential_provider`, `…_api_key_credential_provider` |
 | Agent identity | automatic | `WorkloadIdentity` | `create-workload-identity` | `aws_bedrockagentcore_workload_identity` | `awscc_bedrockagentcore_workload_identity` |
 | Policy (Cedar) | `add policy-engine`, `add policy` | `PolicyEngine`, `Policy` | `create-policy-engine`, `create-policy` | `aws_bedrockagentcore_policy_engine`, `…_policy` | `awscc_bedrockagentcore_policy_engine`, `…_policy` |
 | Memory | `add memory` (or `--memory-mode managed` on a harness) | `Memory` | `create-memory` / `create-event`, `retrieve-memory-records` | `aws_bedrockagentcore_memory`, `…_memory_strategy` | `awscc_bedrockagentcore_memory` |
-| Code Interpreter / Browser | a tool on the harness | `CodeInterpreterCustom`, `BrowserCustom` | `create-code-interpreter`, `create-browser` / `start-code-interpreter-session`, `invoke-code-interpreter` | `aws_bedrockagentcore_code_interpreter`, `…_browser` | `awscc_bedrockagentcore_code_interpreter_custom`, `…_browser_custom` |
+| Code Interpreter / Browser | a tool on the harness | `CodeInterpreterCustom`, `BrowserCustom` | `create-code-interpreter`, `create-browser` / `start-code-interpreter-session` (SDK only: `InvokeCodeInterpreter`) | `aws_bedrockagentcore_code_interpreter`, `…_browser` | `awscc_bedrockagentcore_code_interpreter_custom`, `…_browser_custom` |
 | Evaluations | `add evaluator`, `add online-eval`, `run eval` | `Evaluator`, `OnlineEvaluationConfig`, `Dataset` | `create-evaluator`, `create-online-evaluation-config`, `create-dataset` / `start-batch-evaluation` | `aws_bedrockagentcore_evaluator`, `…_online_evaluation_config` | `awscc_bedrockagentcore_evaluator`, `…_online_evaluation_config` |
 | Resource policy | – | `ResourcePolicy` | `put-resource-policy` | `aws_bedrockagentcore_resource_policy` | `awscc_bedrockagentcore_resource_policy` |
 
