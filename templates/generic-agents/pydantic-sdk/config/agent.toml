@@ -1,0 +1,34 @@
+# Generic agent configuration. Parsed once at startup into domain types (org_agents.shell.config).
+# Deploy-time overrides via env: BEDROCK_MODEL_ID, AWS_REGION, AGENT_MAX_TURNS, AGENT_MAX_USD, ...
+
+[agent]
+name = "generic_pydantic"
+busy_policy = "steer"          # steer | queue | reject: message from the run owner while busy
+
+[model]
+# Use a tagged *application inference profile* ARN per agent in production (cost attribution).
+id = "global.anthropic.claude-sonnet-4-6"
+region = "eu-west-1"
+# USD per 1M tokens: illustrative; set from the Bedrock pricing page for your model/profile.
+price = { input_per_mtok = "3.00", output_per_mtok = "15.00", cache_read_per_mtok = "0.30", cache_write_per_mtok = "3.75" }
+
+[limits]
+max_turns = 12
+max_total_tokens = 200000
+max_usd = "0.50"
+max_wall_seconds = 300
+max_tool_calls = 20
+repeat_threshold = 3            # identical tool call N times → stop (loop detection)
+
+[tools]
+allowed = ["calculate", "search_knowledge", "get_ticket", "create_ticket"]
+approval_required = ["create_ticket"]
+
+[approvals]
+self_approval = false           # four-eyes: the requester cannot approve their own ticket
+approvers = ["auth0|service-desk-lead"]
+
+[identity]
+# Namespace of the custom claims the Auth0 post-login Action adds to access tokens:
+# <ns>email (required for people), <ns>given_name, <ns>family_name, <ns>user_id (optional).
+claim_namespace = "https://fintech.example/"

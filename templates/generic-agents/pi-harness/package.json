@@ -1,0 +1,23 @@
+{
+  "name": "generic-agent-pi-harness",
+  "version": "0.1.0",
+  "description": "Generic tool-using agent on the pi SDK (in-process AgentSession + org guard extension), hosted on AgentCore Runtime; tools via the generic-tools MCP server / AgentCore Gateway.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.19"
+  },
+  "scripts": {
+    "start": "node src/shell/app.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "0.86.0",
+    "@org/agents": "file:../../shared/ts/org-agents"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "6.0.3"
+  }
+}

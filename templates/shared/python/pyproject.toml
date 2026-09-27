@@ -1,0 +1,33 @@
+[project]
+name = "org-agents"
+version = "0.1.0"
+description = "Shared agent controls: domain types, parsers, guard (limits, budget, loop detection), message policy, redaction, audit, idempotency."
+requires-python = ">=3.12"
+dependencies = []   # core and shell are standard-library only
+
+[build-system]
+requires = ["uv_build>=0.8.17,<0.9"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["mypy>=1.18", "pytest>=8", "ruff>=0.13"]
+
+[tool.uv]
+exclude-newer = "2026-09-20T00:00:00Z"   # 7-day cooldown (see CODING_STANDARDS.md §7)
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

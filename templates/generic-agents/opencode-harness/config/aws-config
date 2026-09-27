@@ -1,0 +1,6 @@
+# AWS config for the opencode child process (AGENTS_OPENCODE_BEDROCK.md §3.1).
+# opencode enables the AWS SDK credential chain when a profile is set (AWS_PROFILE=agentcore);
+# credential_process fetches the AgentCore Runtime execution-role credentials from the metadata
+# endpoint and is re-run by the SDK before they expire. No keys, no bearer token.
+[profile agentcore]
+credential_process = node /app/generic-agents/opencode-harness/src/shell/imdsCredentials.ts

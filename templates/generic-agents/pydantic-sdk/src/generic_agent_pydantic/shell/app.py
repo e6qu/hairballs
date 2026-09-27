@@ -1,0 +1,101 @@
+"""AgentCore Runtime entrypoint (shell): HTTP ``/invocations`` + ``/ping`` via ``bedrock-agentcore``.
+
+Run locally:  ``uv run python -m generic_agent_pydantic.shell.app``  (serves 0.0.0.0:8080)
+Deploy:       ``agentcore deploy`` (see README).
+
+``USERS_DB`` selects the SQLite user directory (org user ids per Auth0 ``sub``); ``REQUIRE_TOKEN=true``
+refuses requests without a bearer token instead of acting as the local development user.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+from collections.abc import Mapping
+
+from bedrock_agentcore.runtime import BedrockAgentCoreApp
+from bedrock_agentcore.runtime.context import RequestContext
+from generic_tools.shell.backends import LocalCorpus, SqliteTicketStore
+from generic_tools.shell.service import GenericTools
+from org_agents.domain import SessionId
+from org_agents.parsing import ParseError
+from org_agents.shell.audit import JsonLinesAuditSink
+from org_agents.shell.clock import SystemClock
+from org_agents.shell.config import kill_switch_from
+from org_agents.shell.identity import IdentityResolver, SqliteUserDirectory
+from org_agents.shell.invocation import parse_incoming
+from org_agents.shell.replies import render
+from org_agents.shell.settings import Settings, load_settings
+from pydantic_ai.models.bedrock import BedrockConverseModel, BedrockModelSettings
+from pydantic_ai.providers.bedrock import BedrockProvider
+
+from generic_agent_pydantic.shell.runner import SessionRunner
+
+
+class Registry:
+    """One runner per session. AgentCore gives each session its own microVM, so this is small."""
+
+    def __init__(self, settings: Settings, env: Mapping[str, str]) -> None:
+        self._settings = settings
+        self._env = env
+        self._runners: dict[SessionId, SessionRunner] = {}
+        self._lock = threading.Lock()
+        self._tools = GenericTools(LocalCorpus(), SqliteTicketStore(env.get("TICKETS_DB", ":memory:")))
+        # Requests without a token act as LOCAL_USER (local runs); REQUIRE_TOKEN=true refuses them.
+        directory = SqliteUserDirectory(env.get("USERS_DB", ":memory:"))
+        if env.get("REQUIRE_TOKEN") == "true":
+            self.identity = IdentityResolver(settings.identity, directory, local_user=None)
+        else:
+            self.identity = IdentityResolver(settings.identity, directory)
+
+    def runner(self, session: SessionId) -> SessionRunner:
+        with self._lock:
+            if session not in self._runners:
+                cfg = self._settings.agent
+                # Bedrock prompt caching: cache points after the (stable) instructions, the (fixed)
+                # tool definitions and the latest user message.
+                model = BedrockConverseModel(
+                    cfg.model_id.value,
+                    provider=BedrockProvider(region_name=cfg.region.value),
+                    settings=BedrockModelSettings(
+                        bedrock_cache_instructions=True,
+                        bedrock_cache_tool_definitions=True,
+                        bedrock_cache_messages=True,
+                    ),
+                )
+                self._runners[session] = SessionRunner(
+                    session,
+                    self._settings,
+                    model,
+                    self._tools,
+                    SystemClock(),
+                    JsonLinesAuditSink(),
+                    lambda: kill_switch_from(os.environ),
+                )
+            return self._runners[session]
+
+
+app = BedrockAgentCoreApp()
+_registry: Registry | None = None
+
+
+def registry() -> Registry:
+    global _registry
+    if _registry is None:
+        _registry = Registry(load_settings(os.environ), os.environ)
+    return _registry
+
+
+@app.entrypoint
+def invoke(payload: object, context: RequestContext) -> dict[str, object]:
+    try:
+        session = SessionId.parse(context.session_id or "local-session-0000000000000000000000", "$.session")
+        caller = registry().identity.resolve(context.request_headers or {})
+        incoming = parse_incoming(payload, caller.subject)
+    except ParseError as exc:
+        return {"status": "invalid_request", "path": exc.path, "error": exc.message}
+    return render(registry().runner(session).handle(incoming, caller))
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
