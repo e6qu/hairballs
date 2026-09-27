@@ -5,6 +5,7 @@
 
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
 import { mkdtempSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { connect, createServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -267,4 +268,71 @@ export async function startToolsServer(): Promise<ToolsServer> {
       await exited;
     },
   };
+}
+
+// ---------------------------------------------------------------- fake MCP endpoint (header capture)
+
+export type McpRequestSeen = {
+  readonly method: string;
+  /** The `Authorization` header as received, or null. */
+  readonly authorization: string | null;
+  readonly params: unknown;
+};
+
+export type FakeMcpServer = { readonly url: string; readonly seen: readonly McpRequestSeen[]; reset(): void; stop(): Promise<void> };
+
+/**
+ * A minimal Streamable-HTTP MCP endpoint standing in for AgentCore Gateway: it records the
+ * `Authorization` header of every JSON-RPC message and answers `tools/call` with `<tool> ok`.
+ */
+export async function startFakeMcpServer(): Promise<FakeMcpServer> {
+  const seen: McpRequestSeen[] = [];
+  let sessions = 0;
+  const server = createHttpServer((request, response) => {
+    const chunks: Buffer[] = [];
+    request.on("data", (chunk: Buffer) => chunks.push(chunk));
+    request.on("end", () => {
+      const message = JSON.parse(Buffer.concat(chunks).toString("utf8")) as { id?: number; method: string; params?: unknown };
+      const auth = request.headers.authorization;
+      seen.push({ method: message.method, authorization: typeof auth === "string" ? auth : null, params: message.params });
+      if (message.id === undefined) {
+        response.writeHead(202).end();
+        return;
+      }
+      const reply = (result: unknown, headers: Record<string, string> = {}): void => {
+        response.writeHead(200, { "content-type": "application/json", ...headers });
+        response.end(JSON.stringify({ jsonrpc: "2.0", id: message.id, result }));
+      };
+      switch (message.method) {
+        case "initialize":
+          sessions += 1;
+          reply({ protocolVersion: "2025-06-18", capabilities: {}, serverInfo: { name: "fake-gateway" } }, { "mcp-session-id": `s${sessions}` });
+          return;
+        case "tools/call": {
+          const name = (message.params as { name?: unknown } | undefined)?.name;
+          reply({ content: [{ type: "text", text: `${String(name)} ok` }] });
+          return;
+        }
+        default:
+          reply({ tools: [] });
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const { port } = server.address() as AddressInfo;
+  return {
+    url: `http://127.0.0.1:${port}/mcp`,
+    seen,
+    reset: () => void seen.splice(0),
+    stop: () =>
+      new Promise<void>((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
+  };
+}
+
+/** An unsigned JWT with the given claims (AgentCore Runtime validates real ones before us). */
+export function testJwt(claims: Record<string, unknown>): string {
+  return `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.c2lnbmF0dXJl`;
 }

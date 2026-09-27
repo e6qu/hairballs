@@ -103,7 +103,7 @@ export class World {
       backend: ModelBackend.openaiCompatible(this.model.baseUrl, ModelId.of("claude-fake")),
       server: TOOLS_SERVER,
       toolsMcpUrl: this.mcpUrl,
-      mcpAuthorization: null,
+      mcpToken: null,
       pluginPath: PLUGIN_PATH,
       modelsPath: join(ROOT, "config", "opencode-models.json"),
       // Deliberately NOT process.env: the child gets an allowlisted environment anyway, and tests

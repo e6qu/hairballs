@@ -2,34 +2,41 @@
  * AgentCore Runtime entrypoint (shell): `GET /ping` + `POST /invocations` on 0.0.0.0:8080, with the
  * same request/response contract as the Python variants (`@org/agents` agentcoreServer).
  *
- * The adapter starts `opencode serve` lazily on the first invocation (one per microVM) and drives
- * it over loopback HTTP; see opencodeHost.ts and runner.ts.
+ * The adapter starts `opencode serve` lazily on the first prompt (one per microVM), with that
+ * caller's Auth0 JWT for the tools MCP server, and drives it over loopback HTTP; see Registry,
+ * opencodeHost.ts and runner.ts.
  *
  *   node src/shell/app.ts            # needs TOOLS_MCP_URL (default http://127.0.0.1:8000/mcp)
  */
 
-import { AsyncLocalStorage } from "node:async_hooks";
-import { createServer } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
-  agentCoreRequestListener,
   type AuditSink,
+  type CallerToken,
   type Clock,
   type Env,
   type Incoming,
+  type InvocationContext,
+  type InvocationHandler,
   JsonLinesAuditSink,
   killSwitchFrom,
   loadSettings,
+  NO_INVOCATION_CONTEXT,
+  type PrincipalId,
+  refused,
   type Reply,
   type SessionId,
   type Settings,
+  startAgentCoreServer,
   SystemClock,
   unwrap,
+  assertNever,
 } from "@org/agents";
 
 import { ModelBackend } from "../domain.ts";
+import { toolIdentity } from "../core/identity.ts";
 import { TOOLS_SERVER } from "../core/permissions.ts";
 import { opencodeBinary } from "./binary.ts";
 import { OpencodeHost } from "./opencodeHost.ts";
@@ -39,22 +46,31 @@ export const PLUGIN_PATH = fileURLToPath(new URL("../plugin/orgGuard.ts", import
 /** opencode agent name used in the generated config. */
 export const AGENT = "org-generic";
 
-/** The caller's `Authorization` header, forwarded to the tools MCP server (AgentCore Gateway). */
-export const requestAuthorization = new AsyncLocalStorage<string | null>();
+export const NOTHING_ASKED_REASON = "nothing has been asked in this session yet";
 
 export type RegistryOptions = {
   readonly settings: Settings;
-  readonly host: (mcpAuthorization: string | null) => OpencodeHost;
+  /** Builds the (single) opencode host; `mcpToken` is forwarded to the tools MCP server. */
+  readonly host: (mcpToken: CallerToken | null) => OpencodeHost;
   readonly clock: Clock;
   readonly audit: AuditSink;
   readonly killSwitch: () => boolean;
 };
 
-/** One runner per session; one opencode server per process (AgentCore: one microVM per session). */
+/**
+ * One runner per session; one opencode server per process (AgentCore: one microVM per session).
+ *
+ * opencode reads the MCP `Authorization` header once, at start. The server is therefore started
+ * on the first prompt, with that caller's JWT, and the process is bound to that principal
+ * (`core/identity.ts`): prompts from any other principal are refused, so no user's run ever
+ * calls the Gateway with another user's token. Keep the runtime `maxLifetime` ≤ the Auth0
+ * access-token lifetime (a refreshed token from the same user is not picked up).
+ */
 export class Registry {
   readonly #o: RegistryOptions;
   readonly #runners = new Map<SessionId, SessionRunner>();
   #host: OpencodeHost | null = null;
+  #bound: PrincipalId | null = null;
 
   constructor(options: RegistryOptions) {
     this.#o = options;
@@ -64,16 +80,18 @@ export class Registry {
     return this.#host;
   }
 
-  runner(session: SessionId, mcpAuthorization: string | null): SessionRunner {
+  /** The principal whose token the tools MCP connection carries (null before the first prompt). */
+  get boundPrincipal(): PrincipalId | null {
+    return this.#bound;
+  }
+
+  runner(session: SessionId, host: OpencodeHost): SessionRunner {
     let runner = this.#runners.get(session);
     if (runner === undefined) {
-      // The first caller's credentials are used for the MCP connection for the server's lifetime
-      // (keep runtime maxLifetime ≤ the token lifetime; see README "Gaps").
-      this.#host ??= this.#o.host(mcpAuthorization);
       runner = new SessionRunner({
         session,
         settings: this.#o.settings,
-        host: this.#host,
+        host,
         agent: AGENT,
         server: TOOLS_SERVER,
         clock: this.#o.clock,
@@ -85,13 +103,33 @@ export class Registry {
     return runner;
   }
 
-  handle(session: SessionId, incoming: Incoming): Promise<Reply> {
-    return this.runner(session, requestAuthorization.getStore() ?? null).handle(incoming);
+  async handle(session: SessionId, incoming: Incoming, context: InvocationContext = NO_INVOCATION_CONTEXT): Promise<Reply> {
+    const decision = toolIdentity(this.#bound, incoming);
+    switch (decision.kind) {
+      case "refuse":
+        return refused(decision.reason);
+      case "bind":
+        this.#bound = decision.principal;
+        this.#host ??= this.#o.host(context.callerToken);
+        break;
+      case "proceed":
+        break;
+      default:
+        return assertNever(decision);
+    }
+    // A cancel or approval before any prompt: nothing can be running or pending yet.
+    if (this.#host === null) return refused(NOTHING_ASKED_REASON);
+    return this.runner(session, this.#host).handle(incoming);
   }
 
   async stop(): Promise<void> {
     await this.#host?.stop();
   }
+}
+
+/** The `/invocations` handler: the context carries the caller's JWT (see `Registry`). */
+export function invocationHandler(registry: Registry): InvocationHandler {
+  return (session, incoming, context) => registry.handle(session, incoming, context);
 }
 
 export function productionRegistry(env: Env): Registry {
@@ -106,7 +144,7 @@ export function productionRegistry(env: Env): Registry {
   const binary = opencodeBinary(env);
   return new Registry({
     settings,
-    host: (mcpAuthorization) =>
+    host: (mcpToken) =>
       new OpencodeHost({
         binary,
         settings,
@@ -114,7 +152,7 @@ export function productionRegistry(env: Env): Registry {
         backend,
         server: TOOLS_SERVER,
         toolsMcpUrl: env["TOOLS_MCP_URL"] ?? "http://127.0.0.1:8000/mcp",
-        mcpAuthorization,
+        mcpToken,
         pluginPath: PLUGIN_PATH,
         modelsPath: join(home, "config", "opencode-models.json"),
         env,
@@ -128,18 +166,13 @@ export function productionRegistry(env: Env): Registry {
 
 async function main(): Promise<void> {
   const registry = productionRegistry(process.env);
-  // agentCoreRequestListener is the same contract startAgentCoreServer serves; it is composed here
-  // so the caller's Authorization header can be forwarded to the MCP server (the shared handler
-  // signature does not carry headers).
-  const { listener } = agentCoreRequestListener((session, incoming) => registry.handle(session, incoming));
-  const server = createServer((request, response) => {
-    const auth = request.headers.authorization;
-    requestAuthorization.run(typeof auth === "string" ? auth : null, () => listener(request, response));
-  });
-  server.listen(8080, "0.0.0.0", () => console.error("generic opencode agent listening on 0.0.0.0:8080"));
+  const server = await startAgentCoreServer({ handler: invocationHandler(registry) });
+  console.error(`generic opencode agent listening on ${server.url}`);
   const shutdown = (): void => {
-    server.close();
-    registry.stop().finally(() => process.exit(0));
+    void server
+      .close()
+      .finally(() => registry.stop())
+      .finally(() => process.exit(0));
   };
   process.once("SIGTERM", shutdown);
   process.once("SIGINT", shutdown);

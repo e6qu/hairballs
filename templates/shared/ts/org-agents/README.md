@@ -12,7 +12,8 @@ What every agent gets from it (see `templates/CODING_STANDARDS.md` §6):
   `MessageId`, `ApprovalId`, `ToolName`, `ToolPattern` (`*`/`?` globs), `Fingerprint`, `ModelId`,
   `AwsRegion`, `Usd` (integer **micro-dollars**, parsed exactly from numbers or decimal strings),
   `TokenCount`, `PositiveInt`, `DurationMs`, `Instant`, `Usage`, `ModelPrice`, `Limits`,
-  `ToolPolicy`, `Prompt`, `ApprovalDecision`.
+  `ToolPolicy`, `Prompt`, `ApprovalDecision`, and the forwarded secrets `CallerToken` (the
+  caller's JWT) and `WorkloadAccessToken`.
 - **Pure core** (`src/core/`): the run guard state machine (turn / token / USD / wall-clock /
   tool-call limits, loop detection, kill switch), exact pricing, tool allowlist + approval
   decisions, message policy (duplicates, steer / queue / reject while busy, cancel, approvals),
@@ -59,10 +60,37 @@ const guard = new RunGuard({
 ```
 
 `startAgentCoreServer({ handler, host, port })` serves the AgentCore contract; the handler
-receives a parsed `SessionId` and `Incoming` and returns a `Reply`, which is rendered to exactly the
+receives a parsed `SessionId`, `Incoming` and `InvocationContext` and returns a `Reply`, which is rendered to exactly the
 JSON the Python variants return (`{"status": "completed", "answers": [...]}`, `approval_required`,
 `stopped`, `steered` / `queued` / `cancelling` / `duplicate`, `refused`, and
 `{"status": "invalid_request", "path", "error"}` for unparseable input).
+
+### Caller identity (`InvocationContext`)
+
+The third handler argument carries the per-request credentials, parsed at the boundary into
+branded types (additive: `(session, incoming) => …` handlers still type-check and work):
+
+```ts
+type InvocationContext = {
+  readonly callerToken: CallerToken | null;                 // Authorization: Bearer <jwt>
+  readonly workloadAccessToken: WorkloadAccessToken | null; // WorkloadAccessToken / X-Amz-Bedrock-AgentCore-Identity-WAT
+};
+startAgentCoreServer({ handler: async (session, incoming, { callerToken }) => runner.handle(incoming, callerToken) });
+```
+
+- `callerToken` is the raw Auth0 JWT, which AgentCore Runtime has **already validated**; it reaches
+  the container only if `Authorization` is in `requestHeaderAllowlist` (see
+  `AGENT_IDENTITY_AUTH0.md` §2). Forward it to AgentCore Gateway (`new McpClient({ url, bearerToken })`)
+  so tool calls carry the user's identity. The bearer scheme is case-insensitive; a non-bearer
+  `Authorization` gives `null`; a bearer value that is not a JWT is `invalid_request`.
+- `workloadAccessToken` is read from `WorkloadAccessToken` (preferred) or
+  `X-Amz-Bedrock-AgentCore-Identity-WAT`, header names case-insensitive; exchange it with
+  AgentCore Identity for outbound credentials.
+- Both are **secrets**: they are never logged, audited or rendered by this library, and parse
+  errors never echo them. Keep it that way in variants (no audit fields, no replies, not in the
+  model's context). Without headers (local development) both are `null` (`NO_INVOCATION_CONTEXT`).
+- Parsers are exported for other servers: `invocationContextFromHeaders`,
+  `callerTokenFromHeaders`, `workloadAccessTokenFromHeaders`.
 
 ## Standards applied
 

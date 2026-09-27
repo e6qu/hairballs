@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
 
-import type { Env, Settings } from "@org/agents";
+import type { CallerToken, Env, Settings } from "@org/agents";
 
 import type { ModelBackend, OcSessionId } from "../domain.ts";
 import type { McpServerName } from "../core/permissions.ts";
@@ -47,7 +47,8 @@ export type HostOptions = {
   readonly backend: ModelBackend;
   readonly server: McpServerName;
   readonly toolsMcpUrl: string;
-  readonly mcpAuthorization: string | null;
+  /** The caller's Auth0 JWT for the tools MCP server; fixed for the life of the process. */
+  readonly mcpToken: CallerToken | null;
   readonly pluginPath: string;
   /** Pinned model catalog (OPENCODE_MODELS_PATH); models are defined in the generated config. */
   readonly modelsPath: string;
@@ -179,7 +180,7 @@ export class OpencodeHost {
         backend: this.#options.backend,
         server: this.#options.server,
         toolsMcpUrl: this.#options.toolsMcpUrl,
-        mcpAuthorization: this.#options.mcpAuthorization,
+        mcpToken: this.#options.mcpToken,
         pluginPath: this.#options.pluginPath,
       }),
     );

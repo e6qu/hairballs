@@ -7,7 +7,7 @@
  * `config/config.ts`, `provider/provider.ts`).
  */
 
-import type { Settings } from "@org/agents";
+import type { CallerToken, Settings } from "@org/agents";
 
 import type { ModelBackend } from "../domain.ts";
 import { type McpServerName, type PermissionRule, permissionRules } from "../core/permissions.ts";
@@ -35,8 +35,8 @@ export type ConfigInput = {
   readonly backend: ModelBackend;
   readonly server: McpServerName;
   readonly toolsMcpUrl: string;
-  /** Forwarded caller credentials for the tools MCP server (AgentCore Gateway), e.g. `Bearer <jwt>`. */
-  readonly mcpAuthorization: string | null;
+  /** The caller's Auth0 JWT, forwarded to the tools MCP server (AgentCore Gateway) as `Bearer <jwt>`. */
+  readonly mcpToken: CallerToken | null;
   readonly pluginPath: string;
 };
 
@@ -90,7 +90,7 @@ export function renderConfig(input: ConfigInput): Record<string, unknown> {
     oauth: false, // credentials are forwarded, never negotiated by opencode
     timeout: 30_000,
   };
-  if (input.mcpAuthorization !== null) mcp["headers"] = { Authorization: input.mcpAuthorization };
+  if (input.mcpToken !== null) mcp["headers"] = { Authorization: `Bearer ${input.mcpToken}` };
   return {
     $schema: "https://opencode.ai/config.json",
     username: "agent",

@@ -23,7 +23,6 @@ import {
   JsonLinesAuditSink,
   killSwitchFrom,
   loadSettings,
-  McpClient,
   type SessionId,
   type Settings,
   startAgentCoreServer,
@@ -35,7 +34,7 @@ import { Guardrail } from "../core/domain.ts";
 import { instanceMetadataSource, refreshEnabled, startCredentialRefresh } from "./credentials.ts";
 import { bedrockModel, createModelRuntime, loadPiModelSettings, type PiModel } from "./model.ts";
 import { SessionRunner, type SessionRunnerOptions } from "./runner.ts";
-import type { ToolCaller } from "./tools.ts";
+import { McpToolGateway, type ToolCaller } from "./tools.ts";
 
 export const DEFAULT_TOOLS_MCP_URL = "http://127.0.0.1:8000/mcp";
 
@@ -63,7 +62,8 @@ export class Registry {
 }
 
 export function invocationHandler(registry: Registry): InvocationHandler {
-  return async (session, incoming) => (await registry.runner(session)).handle(incoming);
+  // The context carries the caller's JWT: the runner forwards it to the Gateway on tool calls.
+  return async (session, incoming, context) => (await registry.runner(session)).handle(incoming, context);
 }
 
 /** Production wiring: Bedrock model, tools MCP server (or Gateway), system clock, stdout audit. */
@@ -77,7 +77,7 @@ export async function productionRegistry(env: Env): Promise<Registry> {
   }
   const modelRuntime: ModelRuntime = await createModelRuntime();
   const model: PiModel = bedrockModel(modelRuntime, settings.agent, piModelSettings, env);
-  const caller: ToolCaller = new McpClient({
+  const caller: ToolCaller = new McpToolGateway({
     url: env["TOOLS_MCP_URL"] ?? DEFAULT_TOOLS_MCP_URL,
     clientInfo: { name: settings.agent.name, version: "0.1.0" },
   });

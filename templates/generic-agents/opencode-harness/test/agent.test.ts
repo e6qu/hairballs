@@ -9,11 +9,15 @@ import { after, before, describe, test } from "node:test";
 
 import {
   approvalResponse,
+  CallerToken,
+  FakeClock,
+  MemoryAuditSink,
+  PrincipalId,
+  SessionId,
   cancelRequest,
   chatMessage,
   McpClient,
   MessageId,
-  type PrincipalId,
   Prompt,
   type Reply,
   renderReply,
@@ -21,8 +25,11 @@ import {
   unwrap,
 } from "@org/agents";
 
+import { OTHER_PRINCIPAL_REASON } from "../src/core/identity.ts";
+import { Registry } from "../src/shell/app.ts";
+import type { OpencodeHost } from "../src/shell/opencodeHost.ts";
 import { STEER_PREFIX } from "../src/shell/runner.ts";
-import { ALICE, hasUv, LEAD, World } from "./support/world.ts";
+import { ALICE, hasUv, LEAD, settings, World } from "./support/world.ts";
 
 const chat = (text: string, mid = "m1", who: PrincipalId = ALICE) =>
   chatMessage(MessageId.of(mid), who, Prompt.of(text));
@@ -217,6 +224,43 @@ describe("opencode harness end to end", { skip: hasUv ? false : "uv is not insta
     const reply = await runner.handle(chat("hurry"));
     release();
     assert.equal(reply.kind === "run_halted" && reply.stop.reason, "wall_clock", JSON.stringify(renderReply(reply)));
+  });
+
+  test("identity: opencode is bound to the first prompter's token; another user's prompt is refused", async () => {
+    const jwt = (sub: string) =>
+      CallerToken.of(`eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ sub })).toString("base64url")}.sig`);
+    const bob = PrincipalId.of("auth0|bob");
+    const started: (CallerToken | null)[] = [];
+    const registry = new Registry({
+      settings: settings(),
+      host: (token): OpencodeHost => {
+        started.push(token);
+        if (world.host === null) throw new Error("world not started");
+        return world.host;
+      },
+      clock: new FakeClock(),
+      audit: new MemoryAuditSink(),
+      killSwitch: () => false,
+    });
+    const session = SessionId.of("thread-identity-000000000000000000000000001");
+    const as = (sub: string) => ({ callerToken: jwt(sub), workloadAccessToken: null });
+    world.model.script([{ text: "hello alice" }, { text: "hello again" }]);
+
+    assert.deepEqual(await registry.handle(session, chat("hi", "m1"), as(ALICE)), { kind: "answer", texts: ["hello alice"] });
+    assert.deepEqual(started, [jwt(ALICE)]);
+    assert.equal(registry.boundPrincipal, ALICE);
+
+    // Bob (same session, or another one in this process) would call the Gateway with Alice's token.
+    const refusedReply = await registry.handle(session, chat("me too", "b1", bob), as(bob));
+    assert.deepEqual(refusedReply, { kind: "refused", reason: OTHER_PRINCIPAL_REASON });
+    assert.doesNotMatch(JSON.stringify(renderReply(refusedReply)), /eyJ/);
+    const other = SessionId.of("thread-identity-000000000000000000000000002");
+    assert.equal((await registry.handle(other, chat("me too", "b2", bob), as(bob))).kind, "refused");
+    assert.equal(world.model.calls, 1);
+
+    // Alice continues; opencode is not restarted.
+    assert.deepEqual(await registry.handle(session, chat("again", "m2"), as(ALICE)), { kind: "answer", texts: ["hello again"] });
+    assert.equal(started.length, 1);
   });
 
   test("a provider error fails the run and the next message starts a new run", async () => {

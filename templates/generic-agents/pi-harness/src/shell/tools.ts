@@ -8,13 +8,19 @@
  * The TypeBox parameter schemas are framework schema (what pi shows the model and validates); they
  * live only here. Arguments are forwarded as untyped data and parsed by the tools service. For
  * `create_ticket` the harness (never the model) sets `requested_by` and `idempotency_key`.
+ *
+ * Every call carries the run owner's Auth0 JWT (`CallerToken`) as `Authorization: Bearer …`, so
+ * AgentCore Gateway (and its Cedar policy) sees the user, not the agent. `McpToolGateway` keeps
+ * one MCP client (and MCP session) per token.
  */
 
 import {
+  type CallerToken,
   describeMcpError,
   expectObject,
   fingerprintArguments,
   idempotencyKey,
+  McpClient,
   type McpCallResult,
   type McpError,
   type Parsed,
@@ -40,13 +46,65 @@ export type GenericTool = {
   readonly harnessIdentity: boolean;
 };
 
-/** Anything that can call an MCP tool (the `McpClient`, or a fake in tests). */
+/**
+ * Anything that can call an MCP tool on behalf of a caller (`McpToolGateway`, or a fake in tests).
+ * `token` is the run owner's JWT, or `null` locally (no `Authorization` header).
+ */
 export type ToolCaller = {
-  callTool(name: ToolName, args: unknown): Promise<Result<McpCallResult, McpError>>;
+  callTool(name: ToolName, args: unknown, token: CallerToken | null): Promise<Result<McpCallResult, McpError>>;
 };
 
-/** Who a call is made for: the run owner, in this session. */
-export type CallIdentity = { readonly session: SessionId; readonly principal: PrincipalId };
+/** Who a call is made for: the run owner (and their token), in this session. */
+export type CallIdentity = {
+  readonly session: SessionId;
+  readonly principal: PrincipalId;
+  readonly callerToken: CallerToken | null;
+};
+
+/**
+ * The production `ToolCaller`: the tools MCP server / AgentCore Gateway, one `McpClient` per
+ * caller token (a Gateway MCP session belongs to one identity). Tokens rotate, so only the most
+ * recently used `maxClients` are kept. The token is only ever sent as a header, never logged.
+ */
+export class McpToolGateway implements ToolCaller {
+  readonly #url: string;
+  readonly #clientInfo: { readonly name: string; readonly version: string };
+  readonly #maxClients: number;
+  readonly #clients = new Map<CallerToken | null, McpClient>();
+
+  constructor(options: {
+    readonly url: string;
+    readonly clientInfo: { readonly name: string; readonly version: string };
+    readonly maxClients?: number;
+  }) {
+    this.#url = options.url;
+    this.#clientInfo = options.clientInfo;
+    this.#maxClients = options.maxClients ?? 16;
+  }
+
+  callTool(name: ToolName, args: unknown, token: CallerToken | null): Promise<Result<McpCallResult, McpError>> {
+    return this.#client(token).callTool(name, args);
+  }
+
+  #client(token: CallerToken | null): McpClient {
+    let client = this.#clients.get(token);
+    if (client === undefined) {
+      client = new McpClient({
+        url: this.#url,
+        clientInfo: this.#clientInfo,
+        ...(token === null ? {} : { bearerToken: token }),
+      });
+    } else {
+      this.#clients.delete(token); // re-inserted below: most recently used last
+    }
+    this.#clients.set(token, client);
+    for (const oldest of this.#clients.keys()) {
+      if (this.#clients.size <= this.#maxClients) break;
+      this.#clients.delete(oldest);
+    }
+    return client;
+  }
+}
 
 // Descriptions match generic_tools.shell.service.TOOL_DESCRIPTIONS (checked by test/tools.test.ts).
 export function genericTools(Type: PiAi["Type"]): readonly GenericTool[] {
@@ -117,7 +175,7 @@ export async function invokeTool(
 ): Promise<ToolOutcome> {
   const args = mcpArguments(tool, modelArguments, identity);
   if (args.kind === "err") return { kind: "error", text: `invalid arguments: ${args.error.message}` };
-  const result = await caller.callTool(tool.name, args.value);
+  const result = await caller.callTool(tool.name, args.value, identity.callerToken);
   if (result.kind === "err") return { kind: "error", text: `${tool.name} is unavailable: ${describeMcpError(result.error)}` };
   return result.value.kind === "ok" ? { kind: "ok", text: result.value.text } : { kind: "error", text: result.value.text };
 }

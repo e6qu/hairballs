@@ -6,7 +6,9 @@
  *   POST /invocations → body parsed as `unknown` → Incoming → injected handler → render(reply)
  *
  * The session id comes from `x-amzn-bedrock-agentcore-runtime-session-id`, the sender from the
- * forwarded JWT (`principalFromHeaders`). Invalid input yields
+ * forwarded JWT (`principalFromHeaders`). The handler's third argument, an `InvocationContext`,
+ * carries the caller's raw JWT and the Workload Access Token (both secrets: never logged here,
+ * never in replies) so a variant can forward the user's identity to AgentCore Gateway. Invalid input yields
  * `{"status": "invalid_request", "path": ..., "error": ...}`, like the Python variants.
  */
 
@@ -17,7 +19,7 @@ import type { Reply } from "../core/conversation.ts";
 import type { Incoming } from "../core/messages.ts";
 import { SessionId } from "../domain.ts";
 import { attempt, must, ParseError } from "../parsing.ts";
-import { parseIncoming, principalFromHeaders } from "./invocation.ts";
+import { type InvocationContext, invocationContextFromHeaders, parseIncoming, principalFromHeaders } from "./invocation.ts";
 import { dumps } from "./json.ts";
 import { render } from "./replies.ts";
 
@@ -25,7 +27,11 @@ export const SESSION_HEADER = "x-amzn-bedrock-agentcore-runtime-session-id";
 export const LOCAL_SESSION = "local-session-0000000000000000000000";
 const MAX_BODY_BYTES = 1024 * 1024;
 
-export type InvocationHandler = (session: SessionId, incoming: Incoming) => Promise<Reply>;
+/**
+ * Handles one parsed invocation. `context` is additive: handlers written for `(session, incoming)`
+ * remain valid.
+ */
+export type InvocationHandler = (session: SessionId, incoming: Incoming, context: InvocationContext) => Promise<Reply>;
 
 export type AgentCoreServerOptions = {
   readonly handler: InvocationHandler;
@@ -80,7 +86,7 @@ const invalid = (error: ParseError): Record<string, unknown> => ({
   error: error.detail,
 });
 
-type Parsed = { readonly session: SessionId; readonly incoming: Incoming };
+type Parsed = { readonly session: SessionId; readonly incoming: Incoming; readonly context: InvocationContext };
 
 function parseRequest(request: IncomingMessage, bodyText: string) {
   return attempt((): Parsed => {
@@ -94,8 +100,9 @@ function parseRequest(request: IncomingMessage, bodyText: string) {
     const sessionRaw = (Array.isArray(header) ? header[0] : header) || LOCAL_SESSION;
     const session = must(SessionId.parse(sessionRaw, "$.session"));
     const sender = must(principalFromHeaders(request.headers));
+    const context = must(invocationContextFromHeaders(request.headers));
     const incoming = must(parseIncoming(raw, sender));
-    return { session, incoming };
+    return { session, incoming, context };
   });
 }
 
@@ -121,7 +128,7 @@ export function agentCoreRequestListener(
     }
     inFlight += 1;
     try {
-      const reply = await handler(parsed.value.session, parsed.value.incoming);
+      const reply = await handler(parsed.value.session, parsed.value.incoming, parsed.value.context);
       send(response, 200, render(reply));
     } catch (error) {
       onError(error);

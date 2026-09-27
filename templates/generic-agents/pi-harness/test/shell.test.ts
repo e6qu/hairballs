@@ -47,7 +47,7 @@ describe("pi message parsing", () => {
 });
 
 describe("tool arguments", () => {
-  const identity = { session: SESSION, principal: ALICE };
+  const identity = { session: SESSION, principal: ALICE, callerToken: null };
 
   test("create_ticket: the harness sets requested_by and the idempotency key, not the model", () => {
     const args = unwrap(

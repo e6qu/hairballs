@@ -4,7 +4,13 @@ import assert from "node:assert/strict";
 import { describe, test } from "node:test";
 
 import {
+  approvalResponse,
+  ApprovalId,
+  cancelRequest,
+  chatMessage,
   fingerprintArguments,
+  MessageId,
+  Prompt,
   PrincipalId,
   SessionId,
   ToolName,
@@ -12,6 +18,7 @@ import {
   type ToolPolicy,
 } from "@org/agents";
 
+import { OTHER_PRINCIPAL_REASON, toolIdentity } from "../src/core/identity.ts";
 import {
   decideAsk,
   McpServerName,
@@ -108,5 +115,24 @@ describe("tool names and permission requests", () => {
     assert.match(a["idempotency_key"] ?? "", /^idem-[0-9a-f]{32}$/);
     assert.equal(a["idempotency_key"], b["idempotency_key"]);
     assert.notEqual(a["idempotency_key"], other["idempotency_key"]);
+  });
+});
+
+describe("tool identity binding", () => {
+  const alice = PrincipalId.of("auth0|alice");
+  const bob = PrincipalId.of("auth0|bob");
+  const chat = (who: PrincipalId) => chatMessage(MessageId.of("m1"), who, Prompt.of("hi"));
+
+  test("the first prompt binds; the same principal proceeds; another principal is refused", () => {
+    assert.deepEqual(toolIdentity(null, chat(alice)), { kind: "bind", principal: alice });
+    assert.deepEqual(toolIdentity(alice, chat(alice)), { kind: "proceed" });
+    assert.deepEqual(toolIdentity(alice, chat(bob)), { kind: "refuse", reason: OTHER_PRINCIPAL_REASON });
+  });
+
+  test("cancels and approvals never bind or start tool calls as their sender", () => {
+    assert.deepEqual(toolIdentity(null, cancelRequest(MessageId.of("c1"), bob)), { kind: "proceed" });
+    assert.deepEqual(toolIdentity(alice, approvalResponse(MessageId.of("a1"), bob, ApprovalId.of("ap-1"), "approve")), {
+      kind: "proceed",
+    });
   });
 });

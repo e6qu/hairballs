@@ -49,7 +49,11 @@ function registerTools(pi: ExtensionAPI, options: OrgExtensionOptions): void {
       parameters: tool.parameters,
       async execute(_toolCallId, params) {
         const run = requireRun(options.slot);
-        const outcome = await invokeTool(options.caller, tool, params, { session: run.session, principal: run.owner });
+        const outcome = await invokeTool(options.caller, tool, params, {
+          session: run.session,
+          principal: run.owner,
+          callerToken: run.callerToken(),
+        });
         // pi marks a tool result as an error when execute throws; the text reaches the model.
         if (outcome.kind === "error") throw new Error(outcome.text);
         const result = { content: [{ type: "text" as const, text: outcome.text }], details: {} };

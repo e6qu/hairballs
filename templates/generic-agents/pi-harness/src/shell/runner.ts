@@ -11,6 +11,11 @@
  *   sender (not pi's `followUp()`, which would run inside the current run and budget, with the
  *   current owner as `requested_by`);
  * - cancel → guard records `cancelled`, `session.abort()`.
+ *
+ * Identity: each message's `InvocationContext` carries the sender's Auth0 JWT. The runner keeps the
+ * latest token per principal, and every tool call of a run uses its **owner's** token (a queued
+ * follow-up runs with its sender's token; an approved call with the requester's). Tokens are never
+ * audited, rendered or shown to the model.
  */
 
 import "./offline.ts"; // before pi runs: PI_OFFLINE & co.
@@ -26,12 +31,15 @@ import {
 import {
   acknowledged,
   type ApprovalDecision,
+  type CallerToken,
   type AuditSink,
   type Clock,
   failed,
   finish,
   type Incoming,
+  type InvocationContext,
   mergeAnswers,
+  NO_INVOCATION_CONTEXT,
   nextFollowUp,
   type PrincipalId,
   receive,
@@ -123,6 +131,8 @@ export class SessionRunner {
   #state: ThreadState = ThreadState.initial();
   /** The call held for approval while the thread is awaiting_approval. */
   #pending: PendingApproval | null = null;
+  /** The latest caller token seen per principal (the sender is the token's `sub`). */
+  readonly #tokens = new Map<PrincipalId, CallerToken>();
 
   private constructor(options: SessionRunnerOptions, pi: AgentSession, slot: RunSlot, tools: readonly GenericTool[]) {
     this.#options = options;
@@ -184,7 +194,8 @@ export class SessionRunner {
     return this.#pi.getActiveToolNames();
   }
 
-  async handle(message: Incoming): Promise<Reply> {
+  async handle(message: Incoming, context: InvocationContext = NO_INVOCATION_CONTEXT): Promise<Reply> {
+    if (context.callerToken !== null) this.#tokens.set(message.sender, context.callerToken);
     const [state, action] = receive(this.#state, message, this.#options.settings.agent.busyPolicy);
     this.#state = state;
     switch (action.kind) {
@@ -244,7 +255,14 @@ export class SessionRunner {
     const { settings, session, clock, audit, killSwitch } = this.#options;
     const cfg = settings.agent;
     const guard = new RunGuard({ session, limits: cfg.limits, price: cfg.price, tools: cfg.tools, clock, audit, killSwitch });
-    const run: ActiveRun = { guard, session, owner, pendingApproval: null, firstTurnChecked: false };
+    const run: ActiveRun = {
+      guard,
+      session,
+      owner,
+      callerToken: () => this.#tokens.get(owner) ?? null,
+      pendingApproval: null,
+      firstTurnChecked: false,
+    };
     this.#slot.current = run;
     // A hung provider call must not outlive the wall-clock limit (the guard also checks per event).
     const wallClock = setTimeout(() => {
@@ -339,6 +357,7 @@ export class SessionRunner {
         const outcome = await invokeTool(this.#options.caller, tool, pending.arguments, {
           session: run.session,
           principal: run.owner,
+          callerToken: run.callerToken(),
         });
         return { kind: "executed", outcome };
       }

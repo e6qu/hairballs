@@ -8,13 +8,22 @@
  *     {"approval": {"id": "...", "decision": "approve"}, "message_id": "..."}  -> ApprovalResponse
  *
  * The sender comes from the (already validated) Auth0 JWT forwarded by AgentCore Runtime in the
- * `Authorization` header; locally it defaults to `local-dev`.
+ * `Authorization` header; locally it defaults to `local-dev`. The raw credentials (the caller's
+ * JWT and the Workload Access Token) are parsed into an `InvocationContext` for the handler.
  */
 
 import { randomUUID } from "node:crypto";
 
 import type { Incoming } from "../core/messages.ts";
-import { ApprovalDecision, ApprovalId, MessageId, PrincipalId, Prompt } from "../domain.ts";
+import {
+  ApprovalDecision,
+  ApprovalId,
+  CallerToken,
+  MessageId,
+  PrincipalId,
+  Prompt,
+  WorkloadAccessToken,
+} from "../domain.ts";
 import { attempt, expectBool, expectObject, fail, field, hasField, must, type Parsed } from "../parsing.ts";
 
 export const LOCAL_PRINCIPAL: PrincipalId = PrincipalId.of("local-dev");
@@ -52,6 +61,45 @@ export function principalFromHeaders(headers: HeaderRecord | Headers): Parsed<Pr
     const fields = must(expectObject(claims, "$.jwt"));
     return must(PrincipalId.parse(must(field(fields, "sub", "$.jwt")), "$.jwt.sub"));
   });
+}
+
+/** Header names under which AgentCore Runtime passes the Workload Access Token (first wins). */
+export const WORKLOAD_ACCESS_TOKEN_HEADERS = ["workloadaccesstoken", "x-amz-bedrock-agentcore-identity-wat"] as const;
+
+/**
+ * Per-request credentials, handed to the invocation handler next to the parsed message. Both are
+ * secrets: pass them on (Gateway, AgentCore Identity), never log, audit or render them.
+ */
+export type InvocationContext = {
+  /** The caller's validated Auth0 JWT; `null` without `Authorization: Bearer …` (local development). */
+  readonly callerToken: CallerToken | null;
+  /** AgentCore Identity's Workload Access Token; `null` when the runtime did not send one. */
+  readonly workloadAccessToken: WorkloadAccessToken | null;
+};
+
+export const NO_INVOCATION_CONTEXT: InvocationContext = { callerToken: null, workloadAccessToken: null };
+
+/** The bearer token of `Authorization: Bearer <jwt>` (scheme case-insensitive), or null. */
+export function callerTokenFromHeaders(headers: HeaderRecord | Headers): Parsed<CallerToken | null> {
+  const auth = headerValue(headers, "authorization");
+  if (auth === undefined || !auth.toLowerCase().startsWith("bearer ")) return { kind: "ok", value: null };
+  return CallerToken.parse(auth.slice(7), "$.headers.authorization");
+}
+
+/** The Workload Access Token from `WorkloadAccessToken` or `X-Amz-Bedrock-AgentCore-Identity-WAT`. */
+export function workloadAccessTokenFromHeaders(headers: HeaderRecord | Headers): Parsed<WorkloadAccessToken | null> {
+  for (const name of WORKLOAD_ACCESS_TOKEN_HEADERS) {
+    const value = headerValue(headers, name);
+    if (value !== undefined) return WorkloadAccessToken.parse(value, `$.headers.${name}`);
+  }
+  return { kind: "ok", value: null };
+}
+
+export function invocationContextFromHeaders(headers: HeaderRecord | Headers): Parsed<InvocationContext> {
+  return attempt(() => ({
+    callerToken: must(callerTokenFromHeaders(headers)),
+    workloadAccessToken: must(workloadAccessTokenFromHeaders(headers)),
+  }));
 }
 
 /** Parse an `/invocations` body. `newMessageId` supplies ids for bodies without `message_id`. */

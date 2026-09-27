@@ -30,7 +30,8 @@ harness, never by the model).
 | Caching | pi adds Bedrock `cachePoint`s when the model **name** contains the family (`[pi] model_family`, since inference-profile ARNs don't match). Stable system prompt, fixed tool list, append-only history |
 | Supply chain | `PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`, `PI_TELEMETRY=0` forced in `src/shell/offline.ts` (and the Dockerfile); no extension/skill/prompt/theme/context-file discovery; in-memory settings, session and credential store (nothing read from `~/.pi`) |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
-| Identity | The caller's Auth0 JWT (validated by the runtime's `customJWTAuthorizer`) → `sub` is the principal; pi's `ctx` has no request identity, so the runner publishes the active run (owner, guard) to the extension (`RunSlot`) |
+| Identity | The caller's Auth0 JWT (validated by the runtime's `customJWTAuthorizer`) → `sub` is the principal; pi's `ctx` has no request identity, so the runner publishes the active run (owner, guard, owner's token) to the extension (`RunSlot`) |
+| Gateway identity | The handler's `InvocationContext` (`@org/agents`) gives the raw JWT (`Authorization` must be in `requestHeaderAllowlist`). The runner keeps the latest token per principal and every MCP `tools/call` of a run carries its **owner's** token as `Authorization: Bearer …` (`McpToolGateway`: one `McpClient`/MCP session per token, the 16 most recent kept). A queued follow-up runs with its sender's token; an approved call runs with the requester's token (not the approver's). Tokens are never audited, rendered, logged or shown to the model |
 
 ## How AGENT_PI_BEDROCK.md maps to code
 
@@ -41,7 +42,7 @@ harness, never by the model).
 | §3.4 guardrail via `before_provider_request` (fails open) | `src/shell/guardrail.ts`; intervention → policy stop in `src/core/outcome.ts` |
 | §4 SDK in-process, `-nc`, only our extensions | `src/shell/runner.ts` (`DefaultResourceLoader` with `noExtensions`, `noSkills`, `noPromptTemplates`, `noThemes`, `noContextFiles`, inline `extensionFactories`) |
 | §5 org guard extension | `src/shell/orgExtension.ts` + shared `RunGuard`; decisions in `src/core/gate.ts` |
-| §5 gateway tools (`pi.registerTool` + TypeBox, MCP `tools/call`) | `src/shell/tools.ts` + `@org/agents` `McpClient` |
+| §5 gateway tools (`pi.registerTool` + TypeBox, MCP `tools/call`) | `src/shell/tools.ts` (`McpToolGateway`: `@org/agents` `McpClient` per caller token) |
 | §6 steer / queue / cancel / dedupe | `src/shell/runner.ts` + `@org/agents` `core/thread` |
 | §7.3 approval → pending result, resume with a new turn | `src/core/approval.ts`, `src/shell/runner.ts` |
 | §8 no runtime installs, `PI_OFFLINE=1` | `src/shell/offline.ts`, Dockerfile |
@@ -63,7 +64,7 @@ src/shell/
 ├── offline.ts            # PI_OFFLINE & co. (imported first)
 ├── piAi.ts               # pi's own copy of pi-ai (TypeBox, faux) / smithy IMDS
 ├── piMessages.ts         # pi messages (untyped) → Usage / FinalMessage
-├── tools.ts              # TypeBox schemas + MCP tools/call (requested_by, idempotency key)
+├── tools.ts              # TypeBox schemas + MCP tools/call (requested_by, idempotency key, caller token)
 ├── orgExtension.ts       # the org pi extension: RunGuard hooks, approval hold, redaction, tools
 ├── guardrail.ts          # before_provider_request → guardrailConfig
 ├── model.ts              # ModelRuntime + Bedrock inference profile; [pi] settings
@@ -89,7 +90,11 @@ self-approval and a single creation, rejected approval, loop detection, budget s
 (`AGENT_MAX_USD=0.10`, 100k input tokens), kill switch (no model call), unregistered tool,
 duplicate + cancel when idle, steering mid-run, queued follow-up from another user, cancel mid-run,
 redaction, provider error → `failed` then a new run, guardrail → `stopped`, invalid payloads at the
-HTTP boundary, built-in tools off.
+HTTP boundary, built-in tools off. `test/identity.test.ts` uses an in-process fake MCP endpoint
+that records headers: the owner's JWT reaches the Gateway per run (Alice's run with Alice's token,
+Bob's queued follow-up with Bob's, an approved call with the requester's, and over HTTP from the
+`/invocations` `Authorization` header), and no token appears in replies, audit events, the
+model's context or console output.
 
 Locally against Bedrock (AWS credentials with `bedrock:InvokeModel*` on the model) and the tools server:
 
@@ -150,8 +155,10 @@ guardrail enforced in IAM as well; Observability and Evaluations on.
 
 ## Known gaps
 
-- **Gateway identity:** the MCP client does not forward the caller's JWT, because the shared
-  `InvocationHandler` does not expose the raw `Authorization` token (shared-lib change needed).
+- **Token lifetime:** a run uses its owner's most recent token; a token that expires during a long
+  run (or while an approval waits) makes the Gateway reject the call, which the model sees as a
+  tool error. The requester's next message refreshes it. Outbound credentials via the Workload
+  Access Token (Token Vault) are not used by these tools.
 - No approval-granted/rejected audit event type in `@org/agents` (the approved call is audited as a
   `tool_decision`); no dedicated `guardrail` stop reason (uses `framework_limit`).
 - Replies are JSON, not SSE streaming; no transcript export to S3 on `agent_settled`.

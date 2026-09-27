@@ -9,19 +9,20 @@ import type { AddressInfo } from "node:net";
 import { describe, test } from "node:test";
 
 import {
-  agentCoreRequestListener,
   AwsRegion,
+  CallerToken,
   FakeClock,
   MemoryAuditSink,
   ModelId,
   SESSION_HEADER,
+  startAgentCoreServer,
   TokenCount,
   unwrap,
 } from "@org/agents";
 
 import { ModelBackend, OcSessionId } from "../src/domain.ts";
 import { TOOLS_SERVER } from "../src/core/permissions.ts";
-import { Registry } from "../src/shell/app.ts";
+import { invocationHandler, NOTHING_ASKED_REASON, Registry } from "../src/shell/app.ts";
 import { GUARD_TOKEN_HEADER, GuardBridge, type GuardTarget } from "../src/shell/guardBridge.ts";
 import { fetchImdsCredentials, renderCredentialProcess } from "../src/shell/imdsCredentials.ts";
 import { MODEL_KEY, renderConfig } from "../src/shell/opencodeConfig.ts";
@@ -108,7 +109,7 @@ describe("rendered opencode config", () => {
     const config = renderConfig({
       ...base,
       backend: ModelBackend.bedrock(ModelId.of("arn:aws:bedrock:eu-west-1:123:application-inference-profile/x"), AwsRegion.of("eu-west-1"), "agentcore"),
-      mcpAuthorization: "Bearer token-1",
+      mcpToken: CallerToken.of("eyJhbGciOiJub25lIn0.eyJzdWIiOiJhIn0.sig"),
     });
     const text = JSON.stringify(config);
     assert.equal(config["model"], `amazon-bedrock/${MODEL_KEY}`);
@@ -120,7 +121,7 @@ describe("rendered opencode config", () => {
     assert.equal(config["autoupdate"], false);
     assert.equal(config["snapshot"], false);
     assert.deepEqual(config["plugin"], ["/app/plugin/orgGuard.ts"]);
-    assert.match(text, /"gw":\{"type":"remote","url":"https:\/\/gw.example\/mcp","oauth":false,"timeout":30000,"headers":\{"Authorization":"Bearer token-1"\}\}/);
+    assert.match(text, /"gw":\{"type":"remote","url":"https:\/\/gw.example\/mcp","oauth":false,"timeout":30000,"headers":\{"Authorization":"Bearer eyJhbGciOiJub25lIn0\.eyJzdWIiOiJhIn0\.sig"\}\}/);
     const permission = config["permission"] as Record<string, string>;
     assert.equal(permission["*"], "deny");
     assert.equal(permission["gw_create_ticket"], "ask");
@@ -198,6 +199,8 @@ describe("IMDS credential_process helper", () => {
   });
 });
 
+const JWT_ALICE = `eyJhbGciOiJub25lIn0.${Buffer.from(JSON.stringify({ sub: "auth0|alice" })).toString("base64url")}.sig`;
+
 describe("/invocations boundary", () => {
   test("invalid payloads are rejected before any run (no opencode needed)", async () => {
     const registry = new Registry({
@@ -209,10 +212,8 @@ describe("/invocations boundary", () => {
       audit: new MemoryAuditSink(),
       killSwitch: () => false,
     });
-    const { listener } = agentCoreRequestListener((session, incoming) => registry.handle(session, incoming));
-    const server = createHttpServer(listener);
-    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const server = await startAgentCoreServer({ handler: invocationHandler(registry), host: "127.0.0.1", port: 0 });
+    const { url } = server;
     try {
       for (const payload of [{ prompt: "" }, { nope: 1 }, "text", { approval: { id: "x", decision: "maybe" } }]) {
         const response = await fetch(`${url}/invocations`, {
@@ -223,11 +224,20 @@ describe("/invocations boundary", () => {
         const body = (await response.json()) as Record<string, unknown>;
         assert.equal(body["status"], "invalid_request", JSON.stringify(payload));
       }
+      // A cancel or approval before any prompt is refused without starting opencode (or binding).
+      for (const payload of [{ cancel: true }, { approval: { id: "x", decision: "approve" } }]) {
+        const response = await fetch(`${url}/invocations`, {
+          method: "POST",
+          headers: { [SESSION_HEADER]: "thread-1-00000000000000000000000000", authorization: `Bearer ${JWT_ALICE}` },
+          body: JSON.stringify(payload),
+        });
+        assert.deepEqual(await response.json(), { status: "refused", reason: NOTHING_ASKED_REASON });
+      }
+      assert.equal(registry.boundPrincipal, null);
       assert.deepEqual(await (await fetch(`${url}/ping`)).json(), { status: "Healthy" });
       assert.equal(registry.host, null);
     } finally {
-      server.closeAllConnections();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await server.close();
     }
   });
 });

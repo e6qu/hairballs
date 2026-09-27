@@ -5,7 +5,7 @@
  * before it calls `session.prompt()` and clears it afterwards (AGENT_PI_BEDROCK.md §7.1).
  */
 
-import type { PrincipalId, RunGuard, SessionId } from "@org/agents";
+import type { CallerToken, PrincipalId, RunGuard, SessionId } from "@org/agents";
 
 import type { PendingApproval } from "../core/approval.ts";
 
@@ -14,6 +14,11 @@ export type ActiveRun = {
   readonly session: SessionId;
   /** The principal the run acts for (`requested_by` of side-effecting tools). */
   readonly owner: PrincipalId;
+  /**
+   * The owner's latest Auth0 JWT (forwarded to the Gateway on every tool call), read at call time
+   * so a token refreshed by a later message from the same principal is used. `null` locally.
+   */
+  readonly callerToken: () => CallerToken | null;
   /** Set by the `tool_call` hook when a call is held for human approval. */
   pendingApproval: PendingApproval | null;
   /**

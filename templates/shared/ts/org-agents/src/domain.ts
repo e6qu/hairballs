@@ -21,6 +21,7 @@ import {
   field,
   fieldOr,
   must,
+  typeName,
   type Parsed,
 } from "./parsing.ts";
 import { ok, traverse } from "./result.ts";
@@ -459,3 +460,53 @@ export const ApprovalDecision = {
     return value === "approve" || value === "reject" ? ok(value) : fail(path, "must be 'approve' or 'reject'");
   },
 } as const;
+
+// ---------------------------------------------------------------- forwarded credentials
+//
+// Secrets forwarded by AgentCore Runtime. They are passed on only to the services that need them
+// (AgentCore Gateway, AgentCore Identity) and never reach the model, audit events, replies or logs.
+// Parse errors never echo the value.
+
+const CREDENTIAL_MAX_CHARS = 16_384;
+// A compact JWS: three base64url segments (the signature may be empty for `alg: none` test tokens).
+const CALLER_TOKEN_PATTERN = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/;
+// Opaque to us: visible ASCII only (no whitespace or control characters, so it is header-safe).
+const WORKLOAD_TOKEN_PATTERN = /^[\x21-\x7E]+$/;
+
+function credential<T extends string>(label: string, pattern: RegExp, invalid: string) {
+  const is = (text: string): boolean => text.length <= CREDENTIAL_MAX_CHARS && pattern.test(text);
+  return {
+    /** Build from a trusted string (tests); throws without echoing the value. */
+    of(text: string): T {
+      if (!is(text)) throw new RangeError(`invalid ${label}`);
+      return text as T;
+    },
+    parse(raw: unknown, path: string): Parsed<T> {
+      if (typeof raw !== "string") return fail(path, `expected a string, got ${typeName(raw)}`);
+      const text = raw.trim();
+      if (text.length === 0) return fail(path, "must not be empty");
+      if (text.length > CREDENTIAL_MAX_CHARS) return fail(path, `must be at most ${CREDENTIAL_MAX_CHARS} characters`);
+      return pattern.test(text) ? ok(text as T) : fail(path, invalid);
+    },
+  } as const;
+}
+
+/**
+ * The caller's Auth0 access token (the raw JWT from `Authorization: Bearer …`), already validated
+ * by AgentCore Runtime's `customJWTAuthorizer`. Forward it to AgentCore Gateway so tool calls
+ * carry the user's identity. A secret: never log, audit, render or show it to the model.
+ */
+export type CallerToken = Brand<string, "CallerToken">;
+export const CallerToken = credential<CallerToken>("caller token", CALLER_TOKEN_PATTERN, "is not a JWT");
+
+/**
+ * The Workload Access Token AgentCore Runtime issues for (workload, user) and passes in the
+ * `WorkloadAccessToken` header; exchange it with AgentCore Identity for outbound credentials
+ * (Token Vault). A secret: never log, audit, render or show it to the model.
+ */
+export type WorkloadAccessToken = Brand<string, "WorkloadAccessToken">;
+export const WorkloadAccessToken = credential<WorkloadAccessToken>(
+  "workload access token",
+  WORKLOAD_TOKEN_PATTERN,
+  "must be visible ASCII without spaces",
+);

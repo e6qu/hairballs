@@ -30,7 +30,7 @@ cooldown). Every harness API used here was re-verified against the `v1.18.31` so
 | Budget | Tokens from opencode (`input`, `output` + `reasoning`, cache read / write), priced with the **org price** in `agent.toml` (integer micro-dollars). opencode's `cost` field (catalog estimate) is ignored. Usage is deduplicated by message id and reconciled from `GET /session/:id/message` before every model call and at the end of the run, so an event race cannot let a call through |
 | Tool policy | Deny-by-default opencode permissions **generated from the org `ToolPolicy`** (`src/core/permissions.ts`): `*` and every built-in (bash, edit, read, webfetch, websearch, task, skill, external_directory, question, …) → `deny` (hidden from the model), allowlisted `gw_*` tools → `allow`, approval tools → `ask`, `doom_loop` → `ask`. The same ruleset is also passed on `POST /session` (session rules are evaluated last). The guard plugin checks the allowlist again for every call; a tool the model invents arrives as opencode's `invalid` pseudo tool and is judged by the name the model asked for (audit: `denied`) |
 | Approval | For an approval tool, `tool.execute.before` lets the call proceed to opencode's permission check (`ask`), after writing `requested_by` + `idempotency_key` into `output.args` (the very object passed to the MCP call). opencode emits `permission.asked` and **waits**; the adapter replies `approval_required` with the approvers (four-eyes: the requester cannot approve unless `self_approval = true`). An authorised `{"approval": {"id", "decision"}}` → `POST /permission/:id/reply` `once` or `reject` (`experimental.continue_loop_on_deny`, so the model is told "rejected by approver" and answers). Every other `ask` is rejected; `doom_loop` → reject + `loop_detected` stop |
-| Messages mid-run | Pure thread state machine (`@org/agents` `core/thread`): the run owner **steers** (`prompt_async` while busy: opencode stores the message and its loop picks it up before the next model call); other users are **queued** and run afterwards as their own run; duplicates are ignored; cancel → guard records `cancelled` + abort |
+| Messages mid-run | Pure thread state machine (`@org/agents` `core/thread`): the run owner **steers** (`prompt_async` while busy: opencode stores the message and its loop picks it up before the next model call); other users' prompts are refused by the identity binding (below), so queuing only applies when the thread's `busy_policy = "queue"` for the owner; duplicates are ignored; cancel → guard records `cancelled` + abort |
 | Failures | A provider/model error (opencode `session.error`) → `{"status": "failed"}`; the thread returns to idle and the next message starts a new run. opencode crashing or the event stream dropping also fails the run, never wedges the thread |
 | Redaction | `tool.execute.after` sends tool output (MCP `content[].text` or built-in `output`) to the adapter, which redacts cards, IBANs, e-mail, AWS keys and bearer tokens before the model and opencode's session DB see it. If the bridge is unreachable, the output is withheld |
 | Fail-safe | The plugin fails **closed**: no bridge, bad token or no active run → model call / tool call refused. The bridge listens on 127.0.0.1 with a random per-process token |
@@ -38,7 +38,8 @@ cooldown). Every harness API used here was re-verified against the `v1.18.31` so
 | Supply chain | No `opencode-ai` postinstall: the platform binary package is an exact-pinned optional dependency (sha512 in the lockfile). No npm plugins (the guard plugin is a local file with **no imports**). `OPENCODE_DISABLE_PROJECT_CONFIG`, `_MODELS_FETCH` (+ pinned empty `config/opencode-models.json`), `_AUTOUPDATE`, `_SHARE`, `_DEFAULT_PLUGINS`, `_CLAUDE_CODE`, `_EXTERNAL_SKILLS`, `_LSP_DOWNLOAD`; the config dir is pre-seeded so opencode's background `npm install @opencode-ai/plugin` is a no-op; nothing is downloaded at runtime |
 | Isolation | opencode gets an **allowlisted environment** (never the adapter's AWS keys), a fresh temp HOME / XDG dirs / session DB and an empty workspace as cwd; it listens only on loopback |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
-| Identity | The caller's Auth0 JWT (validated by the runtime's `customJWTAuthorizer`) → `sub` is the principal. The `Authorization` header is forwarded to the tools MCP server (Gateway + Cedar) in the generated `mcp.gw.headers` |
+| Identity | The caller's Auth0 JWT (validated by the runtime's `customJWTAuthorizer`) → `sub` is the principal. The raw JWT comes from the handler's `InvocationContext` (`@org/agents`; `Authorization` must be in `requestHeaderAllowlist`) and is forwarded to the tools MCP server (Gateway + Cedar) as `Authorization: Bearer …` in the generated `mcp.gw.headers` |
+| Identity binding | opencode reads that header **once, at start**, so `opencode serve` starts on the first **prompt** with that caller's token and the process is bound to that principal (`src/core/identity.ts`, `Registry`). A prompt from any **other** principal is **refused** (`{"status": "refused", "reason": "this agent's tools are bound to the user who started the session …"}`): it would otherwise run with someone else's Gateway identity. Cancels and approval responses are not bound (an approved call runs in the requester's run, with the requester's token); before any prompt they are refused without starting opencode. Restarting opencode with the new token was rejected: it would drop the in-flight run and pending approvals |
 
 ## How AGENTS_OPENCODE_BEDROCK.md maps to code
 
@@ -69,9 +70,10 @@ src/
 ├── domain.ts                 # OcSessionId, OcMessageId, PermissionRequestId, ModelBackend
 ├── core/permissions.ts       # pure: ToolPolicy → opencode ruleset, tool-name mapping, ask routing,
 │                             #       side-effect arguments (requested_by, idempotency key)
+├── core/identity.ts          # pure: which prompts may run with the bound caller's token
 ├── plugin/orgGuard.ts        # opencode plugin (runs in opencode's Bun runtime, no imports)
 └── shell/
-    ├── app.ts                # AgentCore entrypoint (/ping, /invocations), Registry
+    ├── app.ts                # AgentCore entrypoint (startAgentCoreServer), Registry + identity binding
     ├── runner.ts             # one thread = one opencode session; RunGuard; approvals; steering
     ├── opencodeHost.ts       # child process, allowlisted env, event-stream pump
     ├── opencodeApi.ts        # HTTP client (fetch)
@@ -99,8 +101,9 @@ the opencode child never sees the test process's environment. Scenarios: tool us
 four-eyes approval (self-approval refused, created once, `requested_by` from the guard, output
 redacted), rejected approval, loop detection, budget stop (`AGENT_MAX_USD=0.10`, 100k input tokens),
 kill switch (0 model calls), denied tool, duplicate + cancel-when-idle, steering mid-run, cancel
-mid-run, wall clock, provider error → `failed` then a new run. Invalid payloads are tested at the
-HTTP boundary without opencode. ~15 s in total (one opencode process per test file).
+mid-run, wall clock, provider error → `failed` then a new run, identity binding (a second user's
+prompt refused, opencode started once with the first caller's token). Invalid payloads, and
+cancel / approval before any prompt, are tested at the HTTP boundary without opencode. ~15 s in total (one opencode process per test file).
 `OPENCODE_LOGS=1` forwards opencode's logs.
 
 Running locally against Bedrock needs the tools MCP server and a working AWS profile for opencode
@@ -143,11 +146,6 @@ approval latency (a pending approval keeps the opencode session waiting in the m
   install scripts: `opencode-ai` (which needs a postinstall) is not used.
 - **`any`-free, but untyped at the plugin boundary:** `src/plugin/orgGuard.ts` declares only the
   hook shapes it uses (it must not import anything at runtime).
-- **Server composition:** `app.ts` uses `@org/agents` `agentCoreRequestListener` (the listener
-  behind `startAgentCoreServer`, same contract) inside its own `node:http` server, because the
-  shared `InvocationHandler` does not receive request headers and the caller's `Authorization`
-  must be forwarded to the Gateway. Proposed shared-lib change: pass headers (or a request
-  context) to the handler.
 - **Managed config file:** not used; the complete config is generated per process and passed in
   `OPENCODE_CONFIG_CONTENT` (project config disabled; the global config dir is a fresh, pre-seeded
   temp dir with no config file). A managed `/etc/opencode/opencode.json` would be merged last and could silently change
@@ -156,9 +154,12 @@ approval latency (a pending approval keeps the opencode session waiting in the m
 
 ## Gaps
 
-- **Token lifetime:** the MCP `Authorization` header is fixed when opencode starts (first caller of
-  the microVM). Keep `maxLifetime` ≤ the Auth0 access-token lifetime, or restart `serve` with a
-  fresh token. Approvers' tokens are not used for the tool call itself.
+- **Token lifetime:** the MCP `Authorization` header is fixed when opencode starts (first prompter
+  of the microVM); a refreshed token from the same user is not picked up. Keep the runtime
+  `maxLifetime` ≤ the Auth0 access-token lifetime (`AGENTS_OPENCODE_BEDROCK.md`). Approvers'
+  tokens are not used for the tool call itself.
+- **One user per microVM:** other principals' prompts are refused (see *Identity binding*); a
+  shared multi-user thread needs a new session per user, or the pi variant (per-run tokens).
 - **Guardrails:** not wired (design doc §3.2 marks the `guardrailConfig` pass-through as unverified).
 - **CIBA:** approvals come through `/invocations` (org thread core), not Auth0 CIBA.
 - **Compaction / title agents:** a title call is avoided by naming the session; opencode's
