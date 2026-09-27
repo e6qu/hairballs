@@ -23,7 +23,7 @@ The CLI output and generated files shown here come from running `@aws/agentcore`
 
 AgentCore has two ways to run an agent:
 
-- **Runtime.** A serverless server for **your agent code**. You deploy a container or zip that answers `POST /invocations`. Each conversation (session) gets its own small VM, which stays alive between messages for up to 8 hours. Runtime does not contain an agent loop; your code does, whether that is Strands, LangGraph, or anything else.
+- **Runtime.** A serverless server for **your agent code**. You deploy a container or zip that answers `POST /invocations`. Each conversation (session) gets its own Firecracker microVM, which stays alive between messages for up to 8 hours and is destroyed when the session ends. Only Memory, mounted storage, or anything your code saved elsewhere survives. Runtime does not contain an agent loop; your code does, whether that is Strands, LangGraph, or anything else.
 - **Harness.** **AWS's own Strands agent, pre-built and running in Runtime.** You don't write code; you give it a JSON config (model, prompt, tools, skills). It is the closest thing AWS has to a managed, remote Claude Code: an agent loop with a shell, a filesystem and skills, in a sandbox you don't operate.
 
 ```mermaid
