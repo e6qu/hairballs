@@ -1,0 +1,26 @@
+{
+  "name": "generic-agent-opencode-harness",
+  "version": "0.1.0",
+  "description": "Generic tool-using agent on the opencode harness (opencode serve + org guard plugin) behind an AgentCore Runtime adapter.",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.6"
+  },
+  "scripts": {
+    "start": "node src/shell/app.ts",
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@org/agents": "file:../../shared/ts/org-agents"
+  },
+  "optionalDependencies": {
+    "opencode-linux-arm64": "1.18.31",
+    "opencode-linux-x64": "1.18.31"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "typescript": "6.0.3"
+  }
+}
