@@ -45,7 +45,9 @@ for ex in "${examples[@]}"; do
 done
 
 echo "== markdown"
-run "markdownlint" "$ROOT" npx --yes markdownlint-cli2@0.18 "*.md"
-run "snippets match example files" "$ROOT" python3 check_snippets.py
+md_files=("README.md")
+for ex in "${examples[@]}"; do md_files+=("$ex.md"); done
+run "markdownlint" "$ROOT" npx --yes markdownlint-cli2@0.18 "${md_files[@]}"
+run "snippets match example files" "$ROOT" python3 check_snippets.py "${examples[@]}"
 
 exit $fail

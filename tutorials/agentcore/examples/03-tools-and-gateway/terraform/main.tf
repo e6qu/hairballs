@@ -203,6 +203,32 @@ resource "aws_bedrockagentcore_harness" "helpdesk" {
   ]
 }
 
+# Callers (your application) attach this policy to invoke the agent.
+resource "aws_iam_policy" "invoke" {
+  name = "helpdesk-invoke"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["bedrock-agentcore:InvokeHarness", "bedrock-agentcore:InvokeAgentRuntime"]
+      Resource = aws_bedrockagentcore_harness.helpdesk.arn
+    }]
+  })
+}
+
+# Callers that use the gateway directly (step 6) attach this policy.
+resource "aws_iam_policy" "invoke_gateway" {
+  name = "helpdesk-invoke-gateway"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = "bedrock-agentcore:InvokeGateway"
+      Resource = aws_bedrockagentcore_gateway.tools.gateway_arn
+    }]
+  })
+}
+
 output "harness_arn" {
   value = aws_bedrockagentcore_harness.helpdesk.arn
 }

@@ -4,42 +4,39 @@ You will: connect an MCP server to the helpdesk as a tool, then put it and a Lam
 
 A **tool** is something the agent can call: a function with a name, a description and an input schema. **MCP** (Model Context Protocol) is the standard way to serve tools over HTTP. The tickets service in these tutorials is an MCP server at `https://tools.fintech.example/mcp`; use one of your own.
 
-The full files for this tutorial are in [`examples/03-tools-and-gateway/`](examples/03-tools-and-gateway/).
+Infrastructure steps show three columns: **agentcore CLI** | **AWS CLI** | **Terraform**. The full files for this tutorial are in [`examples/03-tools-and-gateway/`](examples/03-tools-and-gateway/).
 
 ## Step 1: Attach an MCP server directly
 
 The simplest way to give the agent tools: point the harness at an MCP server's URL. The harness asks the server for its tools and offers them to the model.
 
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+
 ```bash
-agentcore add tool --harness helpdesk --type remote_mcp --name tickets --url https://tools.fintech.example/mcp
+agentcore add tool --harness helpdesk --type remote_mcp \
+  --name tickets --url https://tools.fintech.example/mcp
 agentcore deploy
 agentcore invoke --session-id "$(uuidgen)" "My laptop does not start. Please open a ticket."
 ```
 
-`app/helpdesk/harness.json` now has:
+`add tool` adds this entry to `tools` in `harness.json`: `{"type": "remote_mcp", "name": "tickets", "config": {"remoteMcp": {"url": "..."}}}`.
 
-```json
-"tools": [
-  {
-    "type": "remote_mcp",
-    "name": "tickets",
-    "config": {
-      "remoteMcp": {
-        "url": "https://tools.fintech.example/mcp"
-      }
-    }
-  }
-]
-```
-
-With the AWS CLI it is one call (`direct` in `cli.sh`, which also defines `harness_id` and `TICKETS_URL`). `--tools` replaces the whole list:
+</td><td>
 
 ```bash
 aws bedrock-agentcore-control update-harness --harness-id "$(harness_id)" \
   --tools "[{\"type\":\"remote_mcp\",\"name\":\"tickets\",\"config\":{\"remoteMcp\":{\"url\":\"$TICKETS_URL\"}}}]"
 ```
 
-In Terraform it is a `tool` block on the harness, with `type = "remote_mcp"` and `config { remote_mcp { url = "..." } }`.
+`--tools` replaces the whole list. This is `./cli.sh direct`; `cli.sh` also defines `harness_id` and `TICKETS_URL`.
+
+</td><td>
+
+A `tool` block on the harness: `type = "remote_mcp"`, `name = "tickets"` and `config { remote_mcp { url = "..." } }`. Step 5 replaces it with the gateway, so [`terraform/main.tf`](examples/03-tools-and-gateway/terraform/main.tf) has only the final form.
+
+</td></tr></table>
+
+Terraform: [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness)
 
 If the server needs a key, add `headers` to `remoteMcp`. Better: put the server behind a gateway, which keeps credentials out of the agent's configuration.
 
@@ -53,7 +50,7 @@ A direct MCP tool is fine for one agent. With many agents and many tools you wan
 
 Any agent, in any framework, can use the same governed tools. The rest of this tutorial puts the tickets server and a new Lambda tool behind one gateway.
 
-## Step 3: Write a Lambda tool
+## Step 3: Write and deploy a Lambda tool
 
 A Lambda target turns a function into tools. The gateway sends the tool's arguments as the event, and the tool name as `<target>___<tool>` in the Lambda context.
 
@@ -105,7 +102,11 @@ The gateway does not read the code, so you describe the tool to it in [`tools/ex
 
 Deploy the function. It needs only a role that can write logs.
 
-<table><tr><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+
+The agentcore CLI does not deploy an existing Lambda function: use the AWS CLI or Terraform.
+
+</td><td>
 
 ```bash
 aws iam create-role --role-name helpdesk-expenses-lambda \
@@ -141,13 +142,29 @@ resource "aws_lambda_function" "expenses" {
 
 </td></tr></table>
 
+Terraform: [`aws_iam_role.expenses_lambda`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role), [`aws_iam_role_policy_attachment.expenses_logs`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment), [`aws_lambda_function.expenses`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/lambda_function)
+
 ## Step 4: Create the gateway and its targets
 
 The gateway has its own **service role**: what the gateway may call. Here that is the Lambda function. The tickets server needs no credentials in this example, so its target has none.
 
 Inbound, the gateway uses `AWS_IAM`: callers sign requests with their AWS credentials, and need `bedrock-agentcore:InvokeGateway` on it.
 
-<table><tr><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+
+```bash
+agentcore add gateway --name helpdesk-tools --protocol-type MCP --authorizer-type AWS_IAM
+agentcore add gateway-target --gateway helpdesk-tools --name tickets --type mcp-server \
+  --endpoint https://tools.fintech.example/mcp
+agentcore add gateway-target --gateway helpdesk-tools --name expenses --type lambda-function-arn \
+  --lambda-arn arn:aws:lambda:eu-west-1:111122223333:function:helpdesk-expenses \
+  --tool-schema-file tools/expenses-tools.json
+agentcore deploy
+```
+
+The gateway is part of the project. The CLI creates the service role and grants it the Lambda.
+
+</td><td>
 
 ```bash
 aws iam create-role --role-name helpdesk-gateway \
@@ -171,7 +188,7 @@ aws bedrock-agentcore-control create-gateway-target --gateway-identifier "$gw" \
   --credential-provider-configurations '[{"credentialProviderType":"GATEWAY_IAM_ROLE"}]'
 ```
 
-`$gw` is the gateway id. Wait until `get-gateway` shows `READY` before adding targets.
+`$gw` is the gateway id. Wait until `get-gateway` shows `READY` before adding targets. `./cli.sh gateway` runs steps 3 to 5.
 
 </td><td>
 
@@ -220,19 +237,9 @@ resource "aws_bedrockagentcore_gateway_target" "expenses" {
 
 </td></tr></table>
 
+Terraform: [`aws_iam_role.gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role), [`aws_iam_role_policy.gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy), [`aws_bedrockagentcore_gateway.tools`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway), [`aws_bedrockagentcore_gateway_target.tickets`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway_target), [`aws_bedrockagentcore_gateway_target.expenses`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway_target)
+
 Full files: [`cli.sh`](examples/03-tools-and-gateway/cli.sh), [`terraform/main.tf`](examples/03-tools-and-gateway/terraform/main.tf), and the policies in [`iam/`](examples/03-tools-and-gateway/iam/).
-
-With the agentcore CLI, the gateway is part of the project. The CLI creates the service role and grants it the Lambda:
-
-```bash
-agentcore add gateway --name helpdesk-tools --protocol-type MCP --authorizer-type AWS_IAM
-agentcore add gateway-target --gateway helpdesk-tools --name tickets --type mcp-server \
-  --endpoint https://tools.fintech.example/mcp
-agentcore add gateway-target --gateway helpdesk-tools --name expenses --type lambda-function-arn \
-  --lambda-arn arn:aws:lambda:eu-west-1:111122223333:function:helpdesk-expenses \
-  --tool-schema-file tools/expenses-tools.json
-agentcore deploy
-```
 
 For an MCP-server target, the gateway lists the server's tools when you create the target. If the server's tools change, run `synchronize-gateway-targets`.
 
@@ -240,15 +247,18 @@ For an MCP-server target, the gateway lists the server's tools when you create t
 
 Replace the direct `tickets` tool with the gateway. The agent then sees `tickets___...` and `expenses___check_claim`. With `awsIam` outbound auth, the harness signs its calls to the gateway with its execution role, so the role needs `bedrock-agentcore:InvokeGateway`.
 
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+
 ```bash
 agentcore remove tool --harness helpdesk --name tickets
 agentcore add tool --harness helpdesk --type agentcore_gateway --name helpdesk-tools --gateway helpdesk-tools
 agentcore deploy
+agentcore invoke --session-id "$(uuidgen)" "Is 210 EUR for one hotel night in London within policy?"
 ```
 
 The CLI adds `InvokeGateway` to the role. `--gateway` needs the gateway deployed first (step 4); for a gateway outside the project use `--gateway-arn`.
 
-<table><tr><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+</td><td>
 
 ```bash
 aws iam put-role-policy --role-name "$HARNESS_ROLE" --policy-name gateway \
@@ -285,13 +295,9 @@ resource "aws_bedrockagentcore_harness" "helpdesk" {
 
 </td></tr></table>
 
-Ask something that needs the Lambda tool:
+Terraform: [`aws_iam_role_policy.harness_gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy), [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness), [`aws_bedrockagentcore_gateway.tools`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway)
 
-```bash
-agentcore invoke --session-id "$(uuidgen)" "Is 210 EUR for one hotel night in London within policy?"
-```
-
-The agent calls `expenses___check_claim` through the gateway and answers that the limit is 180 EUR.
+Ask something that needs the Lambda tool (agentcore CLI column; from the AWS CLI or Terraform path use `agentcore invoke --harness-arn "$HARNESS_ARN" --region eu-west-1 "..."`). The agent calls `expenses___check_claim` through the gateway and answers that the limit is 180 EUR.
 
 ## Step 6: Call the gateway from your own code
 
@@ -403,7 +409,9 @@ GATEWAY_URL=$(terraform -chdir=../terraform output -raw gateway_url) \
 
 Full files: [`python/call_gateway.py`](examples/03-tools-and-gateway/python/call_gateway.py), [`typescript/call-gateway.ts`](examples/03-tools-and-gateway/typescript/call-gateway.ts). With the AWS CLI, `get-gateway --query gatewayUrl` prints the URL.
 
-The caller needs `bedrock-agentcore:InvokeGateway` on the gateway. Both clients were checked against a local MCP server that verifies the SigV4 signatures. **[verify]** against a real gateway: no AWS account was used.
+Terraform: [`aws_bedrockagentcore_gateway.tools`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway), [`aws_iam_policy.invoke_gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy)
+
+The caller needs `bedrock-agentcore:InvokeGateway` on the gateway; in Terraform that is the `helpdesk-invoke-gateway` policy (`aws_iam_policy.invoke_gateway`) to attach to your application's role. Both clients were checked against a local MCP server that verifies the SigV4 signatures. **[verify]** against a real gateway: no AWS account was used.
 
 A gateway with a **JWT** authorizer (tutorial 06) takes a bearer token instead: `httpx2.AsyncClient(headers={"Authorization": f"Bearer {token}"})` in Python, and ``new StreamableHTTPClientTransport(url, { requestInit: { headers: { Authorization: `Bearer ${token}` } } })`` in TypeScript.
 
@@ -415,13 +423,37 @@ A gateway with a **JWT** authorizer (tutorial 06) takes a bearer token instead: 
 
 ## Clean up
 
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+
 ```bash
 agentcore remove tool --harness helpdesk --name helpdesk-tools
 agentcore remove gateway --name helpdesk-tools
 agentcore deploy
-aws lambda delete-function --function-name helpdesk-expenses
 ```
 
-Also delete the Lambda's role `helpdesk-expenses-lambda`. If you used the AWS CLI: `./cli.sh down`. With Terraform: `terraform destroy`.
+Then delete the Lambda function and its role with the last three commands in the AWS CLI column.
+
+</td><td>
+
+```bash
+./cli.sh down
+```
+
+It removes the tools from the harness, the gateway and its targets, and then:
+
+```bash
+aws lambda delete-function --function-name helpdesk-expenses
+aws iam detach-role-policy --role-name helpdesk-expenses-lambda \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+aws iam delete-role --role-name helpdesk-expenses-lambda
+```
+
+</td><td>
+
+```bash
+terraform destroy
+```
+
+</td></tr></table>
 
 Next: [04. Your own code](04-your-own-code.md)

@@ -68,49 +68,35 @@ python3 expense-policy/scripts/per_diem.py --days 4 --city-class major
 # 4 days, 3 nights (major): hotel 540 EUR + meals 240 EUR = 780 EUR
 ```
 
-## Step 3: Upload it to S3
+## Step 3: Upload and attach the skill
 
-The harness fetches skills from S3 with its execution role.
+The harness fetches skills from S3 with its execution role. So: store the folder in S3, let the role read it (`s3:GetObject`, `s3:ListBucket`), and add the skill to the harness. The bucket here is `fintech-agent-skills`; bucket names are global, so pick your own.
 
-```bash
-aws s3api create-bucket --bucket "$BUCKET" \
-  --create-bucket-configuration LocationConstraint="$AWS_REGION"
-aws s3 sync expense-policy/ "s3://$BUCKET/expense-policy/"
-```
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
 
-Here `BUCKET=fintech-agent-skills` and `AWS_REGION=eu-west-1`. Bucket names are global: pick your own.
-
-## Step 4: Attach it to the harness
-
-In the agentcore project from tutorial 01. The CLI also gives the execution role `s3:GetObject` and `s3:ListBucket` on the bucket.
+The agentcore CLI does not create buckets or upload files: run the first two AWS CLI commands (next column). Then, in the project from tutorial 01:
 
 ```bash
 agentcore add skill --harness helpdesk --s3 s3://fintech-agent-skills/expense-policy/
 agentcore deploy
 ```
 
-`app/helpdesk/harness.json` now has:
+`add skill` adds `{"s3Uri": "s3://fintech-agent-skills/expense-policy/"}` to `skills` in `harness.json`. `deploy` also gives the role read access to the bucket.
 
-```json
-"skills": [
-  {
-    "s3Uri": "s3://fintech-agent-skills/expense-policy/"
-  }
-]
-```
-
-Without the agentcore CLI, do the same two things yourself: allow the role to read the bucket, and add the skill to the harness.
-
-<table><tr><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+</td><td>
 
 ```bash
+aws s3api create-bucket --bucket "$BUCKET" \
+  --create-bucket-configuration LocationConstraint="$AWS_REGION"
+aws s3 sync expense-policy/ "s3://$BUCKET/expense-policy/"
+
 aws iam put-role-policy --role-name "$ROLE" --policy-name skills \
   --policy-document file://iam/skills-policy.json
 aws bedrock-agentcore-control update-harness --harness-id "$(harness_id)" \
   --skills "[{\"s3\":{\"uri\":\"s3://$BUCKET/expense-policy/\"}}]"
 ```
 
-`--skills` replaces the whole list. `harness_id` looks up the harness id by name (see `cli.sh`). The policy allows `s3:GetObject` and `s3:ListBucket` on the bucket.
+`--skills` replaces the whole list. Run it all with `./cli.sh up`; `harness_id` looks up the harness id by name.
 
 </td><td>
 
@@ -144,15 +130,33 @@ resource "aws_bedrockagentcore_harness" "helpdesk" {
 }
 ```
 
+`# ...` is the harness from tutorial 01, unchanged.
+
 </td></tr></table>
 
-Full files: [`cli.sh`](examples/02-skills/cli.sh), [`terraform/main.tf`](examples/02-skills/terraform/main.tf). The Terraform file is tutorial 01's plus the four resources above; `# ...` marks the unchanged harness settings.
+Terraform: [`aws_s3_bucket.skills`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket), [`aws_s3_object.expense_policy`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_object), [`aws_iam_role_policy.skills`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy), [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness)
 
-## Step 5: Ask a question that needs the skill
+Full files: [`cli.sh`](examples/02-skills/cli.sh), [`terraform/main.tf`](examples/02-skills/terraform/main.tf) (tutorial 01's file plus the resources above).
+
+## Step 4: Ask a question that needs the skill
+
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
 
 ```bash
 agentcore invoke --session-id "$(uuidgen)" "What is my maximum allowance for a 4-day trip to Paris?"
 ```
+
+</td><td>
+
+No `invoke-harness` in the AWS CLI. Use `agentcore invoke --harness-arn "$HARNESS_ARN" --region eu-west-1 "..."` or the code in step 5.
+
+</td><td>
+
+Terraform does not invoke. Use `agentcore invoke --harness-arn "$HARNESS_ARN" --region eu-west-1 "..."` or the code in step 5.
+
+</td></tr></table>
+
+Terraform: [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness), [`aws_s3_object.expense_policy`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_object)
 
 The answer should be 780 EUR, taken from the script's output.
 
@@ -165,17 +169,17 @@ The answer should be 780 EUR, taken from the script's output.
 
 So an unused skill costs only its description. The script's code never enters the context; only its output does. You can attach many skills to one agent.
 
-## Step 6: Try a new version of the skill on one call
+## Step 5: Try a new version of the skill on one call
 
 Every `InvokeHarness` call can add skills. They are added after the harness's own skills, and a skill with the same name replaces the harness's one. So you can test an edited skill without changing the harness.
 
-Edit `expense-policy/SKILL.md`, then upload it to a drafts prefix:
+Edit `expense-policy/SKILL.md`, then upload it to a drafts prefix (`./cli.sh draft`; the agentcore CLI does not upload files):
 
 ```bash
 aws s3 sync expense-policy/ "s3://$BUCKET/drafts/expense-policy/"
 ```
 
-Call the harness with the draft. The code also prints each tool call, so you can watch step 5 happen.
+Call the harness with the draft. The code also prints each tool call, so you can watch step 4 happen.
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
@@ -239,11 +243,13 @@ npm run invoke -- "Allowance for 4 days in Paris?"
 
 </td></tr></table>
 
-Full files: [`python/invoke_with_skill.py`](examples/02-skills/python/invoke_with_skill.py), [`typescript/invoke-with-skill.ts`](examples/02-skills/typescript/invoke-with-skill.ts). `HARNESS_ARN` is set as in tutorial 01, step 6.
+Terraform: [`aws_s3_bucket.skills`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/s3_bucket), [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness), [`aws_iam_policy.invoke`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy)
+
+Full files: [`python/invoke_with_skill.py`](examples/02-skills/python/invoke_with_skill.py), [`typescript/invoke-with-skill.ts`](examples/02-skills/typescript/invoke-with-skill.ts). `HARNESS_ARN` is set as in tutorial 01, step 3. The caller needs the `helpdesk-invoke` policy from tutorial 01.
 
 You should see a `skills` call with `{"skill_name": "expense-policy"}`, then a `shell` call that runs `per_diem.py`, then the answer. The exact tool arguments depend on the model. **[verify]** the tool names on a live harness: they come from the code that `agentcore export harness` generates.
 
-The agentcore CLI can do the same: `agentcore invoke --skills s3://fintech-agent-skills/drafts/expense-policy/ "..."`.
+With the agentcore CLI: `agentcore invoke --skills s3://fintech-agent-skills/drafts/expense-policy/ "..."`.
 
 **Security:** whoever can invoke the harness can point it at any skill the execution role can read, and skills can run scripts. If your application passes user input to `InvokeHarness`, never let users set `skills`.
 
@@ -255,13 +261,32 @@ The agentcore CLI can do the same: `agentcore invoke --skills s3://fintech-agent
 
 ## Clean up
 
+<table><tr><th>agentcore CLI</th><th>AWS CLI</th><th>Terraform</th></tr><tr><td>
+
 ```bash
 agentcore remove skill --harness helpdesk --s3 s3://fintech-agent-skills/expense-policy/
 agentcore deploy
+```
+
+Then delete the bucket as in the AWS CLI column (last two commands).
+
+</td><td>
+
+```bash
+aws bedrock-agentcore-control update-harness --harness-id "$(harness_id)" --skills '[]'
+aws iam delete-role-policy --role-name "$ROLE" --policy-name skills
 aws s3 rm "s3://$BUCKET" --recursive
 aws s3api delete-bucket --bucket "$BUCKET"
 ```
 
-If you used the AWS CLI: `./cli.sh down`. With Terraform: `terraform destroy`.
+Or `./cli.sh down`.
+
+</td><td>
+
+```bash
+terraform destroy
+```
+
+</td></tr></table>
 
 Next: [03. Tools and the Gateway](03-tools-and-gateway.md)

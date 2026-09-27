@@ -22,7 +22,10 @@ def normalized(line: str) -> str:
 
 def main() -> int:
     problems: list[str] = []
+    only = set(sys.argv[1:])
     for tutorial in sorted(ROOT.glob("[0-9][0-9]-*.md")):
+        if only and tutorial.stem not in only:
+            continue
         examples = ROOT / "examples" / tutorial.stem
         for lang, body in FENCE.findall(tutorial.read_text(encoding="utf-8")):
             suffixes = LANGS.get(lang.lower())

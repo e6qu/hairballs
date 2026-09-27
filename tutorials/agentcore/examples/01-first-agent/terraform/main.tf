@@ -44,6 +44,19 @@ resource "aws_bedrockagentcore_harness" "helpdesk" {
   depends_on = [aws_iam_role_policy.helpdesk]
 }
 
+# Callers (your application) attach this policy to invoke the agent.
+resource "aws_iam_policy" "invoke" {
+  name = "helpdesk-invoke"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["bedrock-agentcore:InvokeHarness", "bedrock-agentcore:InvokeAgentRuntime"]
+      Resource = aws_bedrockagentcore_harness.helpdesk.arn
+    }]
+  })
+}
+
 output "harness_arn" {
   value = aws_bedrockagentcore_harness.helpdesk.arn
 }
