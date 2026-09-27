@@ -12,6 +12,11 @@ A cancel during a run stops it at the next middleware check (``stopped`` / ``can
 cancel while awaiting approval, or a failed run (an exception from the model or the graph),
 returns the thread to idle; tool calls left unanswered in the checkpoint are answered by
 deepagents' ``PatchToolCallsMiddleware`` at the start of the next run.
+
+The caller (who the run acts for, with their profile) travels in the run context (``RunContext``),
+never in the graph state the model sees; it is the requester on tickets and approval requests.
+The model learns who it is assisting from a short preamble in the first ``HumanMessage`` of each
+speaker, never from the system prompt, so the prompt cache stays shared across users.
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ from org_agents.core.messages import (
 from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalDecision, ApprovalId, PrincipalId, SessionId, ToolName
+from org_agents.identity import Caller, first_prompt_preamble
 from org_agents.parsing import ParseError, expect_mapping, expect_sequence, field
 from org_agents.shell.audit import AuditSink
 from org_agents.shell.clock import Clock
@@ -148,6 +154,11 @@ class SessionRunner:
         self._state = ThreadState.initial()
         self._lock = threading.Lock()
         self._pending: PendingApproval | None = None
+        # Who each sender is (profile from their latest token); the run owner's caller is the requester.
+        self._callers: dict[PrincipalId, Caller] = {}
+        # The sender the model was last told it is assisting. Failed or cancelled runs keep their
+        # prompt in the checkpoint (nothing is rolled back), so this never needs a reset.
+        self._introduced: PrincipalId | None = None
 
     @property
     def state(self) -> ThreadState:
@@ -157,8 +168,11 @@ class SessionRunner:
     def control(self) -> RunControl:
         return self._control
 
-    def handle(self, message: Incoming) -> Reply:
+    def handle(self, message: Incoming, caller: Caller) -> Reply:
+        if caller.subject != message.sender:
+            raise ValueError("caller does not match the message sender")
         with self._lock:
+            self._callers[message.sender] = caller
             before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
             if isinstance(action, CancelRun):
@@ -168,7 +182,7 @@ class SessionRunner:
                     self._pending = None  # the HITL interrupt is abandoned; see module docstring
         match action:
             case StartRun(prompt=prompt):
-                return self._run_with_follow_ups(self._prompt(prompt.text), message.sender)
+                return self._run_with_follow_ups(prompt.text, message.sender)
             case Steer(prompt=prompt):
                 self._control.steer(prompt.text)
                 return Acknowledged(Ack.STEERED)
@@ -187,8 +201,13 @@ class SessionRunner:
             case Reject(reason=reason):
                 return Refused(reason)
 
-    @staticmethod
-    def _prompt(text: str) -> dict[str, object]:
+    def _prompt(self, caller: Caller, text: str) -> dict[str, object]:
+        """A new prompt as graph input; the first one of a thread (and of each new speaker) is
+        prefixed with who the model is assisting."""
+        if self._introduced != caller.subject:
+            self._introduced = caller.subject
+            preamble = first_prompt_preamble(caller)
+            text = f"{preamble}\n\n{text}" if preamble else text
         return {"messages": [HumanMessage(content=text)]}
 
     def _owner(self) -> PrincipalId:
@@ -197,26 +216,26 @@ class SessionRunner:
             return status.owner
         raise RuntimeError("no active owner")
 
-    def _run_with_follow_ups(
-        self, first_input: dict[str, object] | Command[Any], owner: PrincipalId
-    ) -> Reply:
+    def _run_with_follow_ups(self, first_input: str | Command[Any], owner: PrincipalId) -> Reply:
         reply = self._run_once(first_input, owner)
         while True:
             with self._lock:
                 self._state, queued = next_follow_up(self._state)
             if queued is None:
                 return reply
-            reply = merge_answers(reply, self._run_once(self._prompt(queued.prompt.text), queued.sender))
+            reply = merge_answers(reply, self._run_once(queued.prompt.text, queued.sender))
 
-    def _run_once(self, graph_input: dict[str, object] | Command[Any], owner: PrincipalId) -> Reply:
+    def _run_once(self, first: str | Command[Any], owner: PrincipalId) -> Reply:
         cfg = self._settings.agent
         guard = RunGuard(
             self._session, cfg.limits, cfg.price, cfg.tools, self._clock, self._audit, self._kill_switch
         )
         self._control.begin(guard)
+        caller = self._callers[owner]
+        graph_input = self._prompt(caller, first) if isinstance(first, str) else first
         outcome: RunOutcome
         try:
-            self._agent.invoke(graph_input, self._config, context=RunContext(owner))
+            self._agent.invoke(graph_input, self._config, context=RunContext(caller))
         except GraphRecursionError:
             # Backstop only: the guard's turn limit should always trip first (core/recursion.py).
             # The recursion limit is derived from max_turns, so turn_limit (not framework_limit).
@@ -235,7 +254,7 @@ class SessionRunner:
                     guard.record_external_stop(StopReason.CANCELLED, CANCEL_DETAIL), outcome.text
                 )
             guard.finish()
-            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
+            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals, caller)
         return reply
 
     def _outcome(self, guard: RunGuard) -> RunOutcome:

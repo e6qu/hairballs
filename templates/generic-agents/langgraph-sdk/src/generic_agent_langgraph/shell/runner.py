@@ -9,6 +9,11 @@ pending approval is cancelled,
 the checkpoint can end with tool calls that will never run. They are answered with error
 ``ToolMessage``s (``update_state(..., as_node="tools")``) so the next prompt starts from a history
 Bedrock accepts (every ``toolUse`` paired with a ``toolResult``).
+
+The caller (who the run acts for, with their profile) travels in the run context (``RunContext``),
+never in the graph state the model sees. The model learns who it is assisting from a short
+preamble in the first ``HumanMessage`` of each speaker, never from the system prompt, so the
+prompt cache stays shared across users.
 """
 
 from __future__ import annotations
@@ -54,6 +59,7 @@ from org_agents.core.messages import (
 from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalId, PrincipalId, SessionId, ToolName
+from org_agents.identity import Caller, first_prompt_preamble
 from org_agents.parsing import ParseError, expect_mapping
 from org_agents.shell.audit import AuditSink
 from org_agents.shell.clock import Clock
@@ -112,13 +118,21 @@ class SessionRunner:
         )
         self._state = ThreadState.initial()
         self._lock = threading.Lock()
+        # Who each sender is (profile from their latest token); the run owner's caller is the requester.
+        self._callers: dict[PrincipalId, Caller] = {}
+        # The sender the model was last told it is assisting. Failed runs keep their prompt in the
+        # checkpoint (dangling tool calls are answered, not rolled back), so this never needs a reset.
+        self._introduced: PrincipalId | None = None
 
     @property
     def state(self) -> ThreadState:
         return self._state
 
-    def handle(self, message: Incoming) -> Reply:
+    def handle(self, message: Incoming, caller: Caller) -> Reply:
+        if caller.subject != message.sender:
+            raise ValueError("caller does not match the message sender")
         with self._lock:
+            self._callers[message.sender] = caller
             before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
             if isinstance(action, CancelRun):
@@ -173,10 +187,13 @@ class SessionRunner:
             self._session, cfg.limits, cfg.price, cfg.tools, self._clock, self._audit, self._kill_switch
         )
         self._guard_mw.begin(guard)
+        caller = self._callers[owner]
         graph_input: GraphInput = (
-            InputAgentState(messages=[HumanMessage(first)]) if isinstance(first, str) else first
+            InputAgentState(messages=[HumanMessage(self._introduce(caller, first))])
+            if isinstance(first, str)
+            else first
         )
-        context = RunContext(principal=owner, session=self._session)
+        context = RunContext(caller=caller, session=self._session)
         outcome: RunOutcome
         try:
             output = self._graph.invoke(graph_input, self._config(), context=context, version="v2")
@@ -200,8 +217,16 @@ class SessionRunner:
                 stop = guard.record_external_stop(StopReason.CANCELLED, CANCEL_DETAIL)
                 outcome = Stopped(stop, outcome.text)
             guard.finish()
-            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
+            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals, caller)
         return reply
+
+    def _introduce(self, caller: Caller, prompt: str) -> str:
+        """Prefix the first prompt of a thread (and of each new speaker) with who the model is assisting."""
+        if self._introduced == caller.subject:
+            return prompt
+        self._introduced = caller.subject
+        preamble = first_prompt_preamble(caller)
+        return f"{preamble}\n\n{prompt}" if preamble else prompt
 
     def _close_dangling_tool_calls(self, text: str) -> None:
         """Answer the last AI message's unanswered tool calls with error results (see module doc)."""

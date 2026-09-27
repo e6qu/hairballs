@@ -20,7 +20,8 @@ from org_agents.parsing import ParseError
 from org_agents.shell.audit import JsonLinesAuditSink
 from org_agents.shell.clock import SystemClock
 from org_agents.shell.config import kill_switch_from
-from org_agents.shell.invocation import parse_incoming, principal_from_headers
+from org_agents.shell.identity import IdentityResolver, SqliteUserDirectory
+from org_agents.shell.invocation import parse_incoming
 from org_agents.shell.replies import render
 from org_agents.shell.settings import Settings, load_settings
 
@@ -36,6 +37,12 @@ class Registry:
         self._runners: dict[SessionId, SessionRunner] = {}
         self._lock = threading.Lock()
         self._tools = GenericTools(LocalCorpus(), SqliteTicketStore(env.get("TICKETS_DB", ":memory:")))
+        # Requests without a token act as LOCAL_USER (local runs); REQUIRE_TOKEN=true refuses them.
+        directory = SqliteUserDirectory(env.get("USERS_DB", ":memory:"))
+        if env.get("REQUIRE_TOKEN") == "true":
+            self.identity = IdentityResolver(settings.identity, directory, local_user=None)
+        else:
+            self.identity = IdentityResolver(settings.identity, directory)
 
     def runner(self, session: SessionId) -> SessionRunner:
         with self._lock:
@@ -70,11 +77,11 @@ def registry() -> Registry:
 def invoke(payload: object, context: RequestContext) -> dict[str, object]:
     try:
         session = SessionId.parse(context.session_id or "local-session-0000000000000000000000", "$.session")
-        sender = principal_from_headers(context.request_headers or {})
-        incoming = parse_incoming(payload, sender)
+        caller = registry().identity.resolve(context.request_headers or {})
+        incoming = parse_incoming(payload, caller.subject)
     except ParseError as exc:
         return {"status": "invalid_request", "path": exc.path, "error": exc.message}
-    return render(registry().runner(session).handle(incoming))
+    return render(registry().runner(session).handle(incoming, caller))
 
 
 if __name__ == "__main__":
