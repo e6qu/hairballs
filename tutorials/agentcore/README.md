@@ -26,6 +26,19 @@ Start with [the developer introduction](../../AGENTCORE_BEDROCK_LANDSCAPE.md) if
 | 09 | [Observability, evals and costs](09-observability-evals-costs.md) | Traces, evaluations, token usage, per-agent cost tracking |
 | 10 | [A coding agent](10-coding-agent.md) | Workspace storage, git with short-lived tokens, running tests |
 
+## How the code is organised
+
+All example code, in both languages, follows the same three rules:
+
+1. **Functional core, imperative shell.** Each example has three parts:
+   - `domain`: types, plus parsers for outside data;
+   - `core`: pure functions, with no AWS, no I/O, no clock and no randomness;
+   - a thin **shell** (the script, handler or agent entrypoint) that reads input, calls AWS and returns output.
+2. **Illegal states are unrepresentable.** A `SessionId` is always 33–256 characters, and a stream event is exactly one of `TextDelta`, `Stopped` or `AgentFailed`. If a value exists, it is valid.
+3. **Parse, don't validate.** Data from outside is turned into domain types **at the boundary**, or rejected. That covers arguments, environment variables, HTTP bodies, JWT claims, SDK events and tool arguments. The JSON itself is never modelled as types.
+
+[Tutorial 01](01-first-agent.md) shows the pattern in full. The repo-wide rules are in [`templates/CODING_STANDARDS.md`](../../templates/CODING_STANDARDS.md).
+
 ## Before you start
 
 - **An AWS account** with Bedrock and AgentCore available in your region. The tutorials use `eu-west-1`.
