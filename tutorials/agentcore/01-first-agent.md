@@ -166,49 +166,98 @@ The second answer knows what "the flight" is, because it ran in the same session
 
 ## Step 4: Call the agent from your application
 
-Your application calls `InvokeHarness` with the harness ARN, a session id and the user's message. The answer streams back as events; print the text deltas.
+Your application calls `InvokeHarness` with the harness ARN, a session id and the user's message. The answer streams back as events.
+
+The code has three parts, the same in both languages:
+
+- **`domain`**: small types that can only hold valid values: `HarnessArn`, `SessionId` (33–256 characters), `Question`, and a `StreamEvent` union (`TextDelta` / `Stopped` / `AgentFailed`). Outside data (arguments, environment, each streamed event) is parsed into these types **at the boundary**, or rejected.
+- **`core`**: pure functions (`render`, `exit_code`). No AWS, no I/O.
+- **shell** (`invoke`): reads input, calls AWS, prints. The only part with side effects.
+
+The shell:
 
 <table><tr><th>Python (<code>boto3</code>)</th><th>TypeScript (<code>@aws-sdk/client-bedrock-agentcore</code>)</th></tr><tr><td>
 
 ```python
-def ask(harness_arn: str, session_id: str, question: str) -> None:
+def ask(harness: HarnessArn, session: SessionId, question: Question) -> int:
     client = boto3.client("bedrock-agentcore", region_name="eu-west-1")
     response = client.invoke_harness(
-        harnessArn=harness_arn,
-        runtimeSessionId=session_id,  # same id = same VM and conversation
-        messages=[{"role": "user", "content": [{"text": question}]}],
+        harnessArn=harness.value,
+        runtimeSessionId=session.value,  # same id = same VM and conversation
+        messages=[{"role": "user", "content": [{"text": question.text}]}],
     )
-    for event in response["stream"]:
-        if "contentBlockDelta" in event:
-            text = event["contentBlockDelta"]["delta"].get("text")
-            if text:
-                print(text, end="", flush=True)
-        elif "messageStop" in event:
-            print(f"\n[stop: {event['messageStop']['stopReason']}]")
-        elif "runtimeClientError" in event:
-            raise RuntimeError(event["runtimeClientError"].get("message"))
+    events: list[StreamEvent] = []
+    for raw in response["stream"]:
+        event = parse_stream_event(raw)  # outside data -> domain type, right here
+        if event is not None:
+            events.append(event)
+            print(render(event), end="", flush=True)
+    return exit_code(events)
 ```
 
 </td><td>
 
 ```typescript
-async function ask(harnessArn: string, sessionId: string, question: string): Promise<void> {
+async function ask(harness: HarnessArn, session: SessionId, question: Question): Promise<number> {
+  const client = new BedrockAgentCoreClient({ region: "eu-west-1" });
   const response = await client.send(
     new InvokeHarnessCommand({
-      harnessArn,
-      runtimeSessionId: sessionId, // same id = same VM and conversation
+      harnessArn: harness,
+      runtimeSessionId: session, // same id = same VM and conversation
       messages: [{ role: "user", content: [{ text: question }] }],
     }),
   );
-  for await (const event of response.stream ?? []) {
-    if (event.contentBlockDelta?.delta?.text) {
-      process.stdout.write(event.contentBlockDelta.delta.text);
-    } else if (event.messageStop) {
-      console.log(`\n[stop: ${event.messageStop.stopReason}]`);
-    } else if (event.runtimeClientError) {
-      throw new Error(event.runtimeClientError.message);
+  const events: StreamEvent[] = [];
+  for await (const raw of response.stream ?? []) {
+    const event = parseStreamEvent(raw); // outside data -> domain type, right here
+    if (event) {
+      events.push(event);
+      process.stdout.write(render(event));
     }
   }
+  return exitCode(events);
+}
+```
+
+</td></tr><tr><td>
+
+The boundary parser (`domain.py`):
+
+```python
+def parse_stream_event(raw: Mapping[str, object]) -> StreamEvent | None:
+    """One event from the InvokeHarness stream, or None for events this client ignores."""
+    if "contentBlockDelta" in raw:
+        text = _fields(_fields(raw["contentBlockDelta"]).get("delta", {})).get("text")
+        return TextDelta(text) if isinstance(text, str) and text else None
+    if "messageStop" in raw:
+        reason = _fields(raw["messageStop"]).get("stopReason")
+        try:
+            return Stopped(StopReason(reason))
+        except ValueError as exc:
+            raise ParseError(f"unknown stop reason: {reason!r}") from exc
+    if "runtimeClientError" in raw:
+        message = _fields(raw["runtimeClientError"]).get("message")
+        return AgentFailed(message if isinstance(message, str) else "the agent failed")
+    return None
+```
+
+</td><td>
+
+The boundary parser (`domain.ts`):
+
+```typescript
+export function parseStreamEvent(raw: InvokeHarnessStreamOutput): StreamEvent | undefined {
+  if (raw.contentBlockDelta) {
+    const text = raw.contentBlockDelta.delta?.text;
+    return text ? { kind: "text", text } : undefined;
+  }
+  if (raw.messageStop) {
+    return { kind: "stopped", reason: parseStopReason(raw.messageStop.stopReason) };
+  }
+  if (raw.runtimeClientError) {
+    return { kind: "failed", message: raw.runtimeClientError.message ?? "the agent failed" };
+  }
+  return undefined;
 }
 ```
 
@@ -230,7 +279,7 @@ npm run invoke -- "Can I expense a taxi?"
 
 Terraform: [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness), [`aws_iam_policy.invoke`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy)
 
-Full files: [`python/invoke.py`](examples/01-first-agent/python/invoke.py), [`typescript/invoke.ts`](examples/01-first-agent/typescript/invoke.ts). Pass a session id as the second argument to continue a conversation.
+Full files: [`python/`](examples/01-first-agent/python/) (`domain.py`, `core.py`, `invoke.py`), [`typescript/`](examples/01-first-agent/typescript/) (`domain.ts`, `core.ts`, `invoke.ts`). Pass a session id as the second argument to continue a conversation.
 
 The caller needs `bedrock-agentcore:InvokeHarness` and `bedrock-agentcore:InvokeAgentRuntime` on the harness ARN. In Terraform, attach this policy to your application's role:
 
