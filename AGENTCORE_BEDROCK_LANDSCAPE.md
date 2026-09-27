@@ -154,7 +154,7 @@ agentcore add tool --harness helpdesk --type agentcore_code_interpreter --name c
 ```
 
 The harness also always has a built-in **shell** tool and a **file** tool, which work in its VM. Other tool types:
-- `agentcore_gateway`: all tools behind an AgentCore Gateway (§4);
+- `agentcore_gateway`: all tools behind an AgentCore Gateway (§5);
 - `agentcore_browser`: a managed headless Chrome;
 - `inline_function`: a tool your calling application executes.
 
@@ -277,6 +277,23 @@ This is the whole picture:
 - **`strands.Agent`** is the loop.
 - The tools and skills are the ones you configured.
 
+**What kind of app is this?** It is **not FastAPI**:
+- `BedrockAgentCoreApp` is a **Starlette** app (FastAPI is built on Starlette) served by **uvicorn**, with three routes: `POST /invocations`, `GET /ping` and a `/ws` WebSocket.
+- It copies the platform's request headers (session id, workload access token) into a `context`, calls your `@app.entrypoint`, and streams any generator back as server-sent events.
+- `/ping` reports `HealthyBusy` while background tasks run (`app.add_async_task`), so AgentCore keeps the session alive.
+
+The major Python dependencies:
+
+| Package | What it brings | Its main dependencies |
+|---|---|---|
+| `bedrock-agentcore` | The Runtime app and clients for Memory, Identity, Code Interpreter and Browser | starlette, uvicorn, pydantic, boto3, websockets |
+| `strands-agents` | The agent loop | boto3, pydantic, httpx, mcp, jsonschema, OpenTelemetry API/SDK |
+| `strands-agents-tools` | Ready-made tools (shell, files, Code Interpreter, Browser, HTTP…) | aiohttp, requests, sympy, rich, slack-bolt, … (a wide set: pin it or vendor only the tools you use) |
+| `mcp` | MCP client, to talk to MCP servers and the Gateway | anyio, httpx, starlette, pydantic |
+| `aws-opentelemetry-distro` (ADOT) | Traces to CloudWatch. The app is started as `opentelemetry-instrument python main.py` | OpenTelemetry SDK plus many auto-instrumentations |
+
+The CLI builds it with **uv**. A zip build runs on an AWS-managed Python on Amazon Linux 2023; a container build uses `python:3.12-slim` and runs as a non-root user. TypeScript agents are a Node 22 app run with `tsx`.
+
 Once exported, the harness is a **Runtime agent with code you own**. Change anything (add hooks, custom tools, guards), then `agentcore deploy` again.
 
 ### Step 8: write your own agent from the start
@@ -311,7 +328,118 @@ That is what all eight of our templates in `templates/generic-agents/` do, in St
 
 ---
 
-## 3. Strands in five minutes
+## 3. The `agentcore` CLI under the hood
+
+The CLI is **a project generator plus a CDK wrapper**. It adds no AWS capability of its own: every resource it makes is an ordinary CloudFormation resource, which you could also create with the AWS CLI, CDK or Terraform.
+
+**What each command group does:**
+
+| Command | What it does | Touches AWS? |
+|---|---|---|
+| `create` | Writes a project folder: `agentcore/agentcore.json` (the list of resources), `aws-targets.json` (account and region), a CDK app in `agentcore/cdk/`, and the agent (`harness.json`, or code for Strands/LangGraph/…) | No |
+| `add …` / `remove …` | Edits `agentcore.json` / `harness.json` (harness, tool, skill, gateway, memory, credential, policy, evaluator…) | No |
+| `dev` | Runs a code agent locally on :8080 | No |
+| `deploy` | Creates or updates everything in AWS (below) | Yes |
+| `invoke`, `invoke --exec` | Calls `InvokeHarness` / `InvokeAgentRuntime` / `InvokeAgentRuntimeCommand` | Yes |
+| `status`, `logs`, `traces` | Reads the deployed state, CloudWatch logs and traces | Yes |
+| `run eval`, `run recommendation`, `run batch-evaluation` | Starts evaluation jobs | Yes |
+| `export harness` | Writes the Strands code equivalent of a harness (Step 7) | No |
+
+**What `agentcore deploy` does, in order:**
+1. **Creates credential providers** (OAuth, API keys) with direct API calls, because they hold secrets that shouldn't pass through CloudFormation.
+2. **Runs the CDK app.** It bootstraps the account for CDK if needed, synthesizes a template, uploads assets to S3 and deploys **one CloudFormation stack per target**, named `AgentCore-<project>-<target>`.
+3. **Records what was deployed** in `agentcore/.cli/deployed-state.json`. Later `invoke`, `status` and `logs` read ARNs from this file.
+4. **Enables CloudWatch Transaction Search**, so traces show up.
+
+**What the stack contains:**
+
+| You added | Stack resources |
+|---|---|
+| A **harness** | `AWS::BedrockAgentCore::Harness` + an IAM role. The role allows: model invocation, S3 read for skills, logs, X-Ray, metrics, the workload-identity token, and Browser, Code Interpreter, Gateway and Memory actions for the tools you configured |
+| A **code agent**, zip build (default) | The code, bundled with `uv` for ARM64 and uploaded as an S3 asset; `AWS::BedrockAgentCore::Runtime` pointing at it; an IAM role (Bedrock invoke on models and inference profiles, logs, X-Ray) |
+| A **code agent**, container build | The above, plus an **ECR repository** (KMS-encrypted, scanned on push), an **ARM64 CodeBuild project** that builds your Dockerfile, and a custom resource that runs the build during deploy. **No Docker needed on your machine** |
+| Memory, gateway, policy engine, evaluator… | `AWS::BedrockAgentCore::Memory`, `::Gateway` + `::GatewayTarget`, `::PolicyEngine` + `::Policy`, `::Evaluator`… Every memory is granted to every agent in the project, and its id is injected as `MEMORY_<NAME>_ID` |
+
+**Created by AgentCore itself, not by the stack:**
+- the agent's **workload identity**;
+- **version 1** and the **`DEFAULT` endpoint** of each runtime;
+- the **log group** `/aws/bedrock-agentcore/runtimes/<id>-<endpoint>`.
+
+### The same pieces in the AWS CLI, CloudFormation and Terraform
+
+AgentCore has two APIs:
+- `aws bedrock-agentcore-control …` **creates** things (the control plane);
+- `aws bedrock-agentcore …` **uses** them (the data plane).
+
+| Piece | `agentcore` CLI | CloudFormation (`AWS::BedrockAgentCore::…`) | AWS CLI: create / use | Terraform `hashicorp/aws` 6.66 | Terraform `hashicorp/awscc` 1.103 |
+|---|---|---|---|---|---|
+| Harness | `add harness`, `add tool`, `add skill` | `Harness`, `HarnessEndpoint` | `create-harness` / `invoke-harness` | `aws_bedrockagentcore_harness` | `awscc_bedrockagentcore_harness`, `…_harness_endpoint` |
+| Code agent (Runtime) | `create --framework …` | `Runtime`, `RuntimeEndpoint` | `create-agent-runtime`, `create-agent-runtime-endpoint` / `invoke-agent-runtime`, `invoke-agent-runtime-command` | `aws_bedrockagentcore_agent_runtime`, `…_agent_runtime_endpoint` | `awscc_bedrockagentcore_runtime`, `…_runtime_endpoint` |
+| Gateway + tools | `add gateway`, `add gateway-target` | `Gateway`, `GatewayTarget`, `GatewayRule`, `GatewayRateLimit` | `create-gateway`, `create-gateway-target`, `create-gateway-rule`, `create-gateway-rate-limit` / (agents call it over MCP HTTP) | `aws_bedrockagentcore_gateway`, `…_gateway_target`, `…_gateway_rule` | `awscc_bedrockagentcore_gateway`, `…_gateway_rule`, `…_gateway_rate_limit` |
+| Credentials (token vault) | `add credential` | `OAuth2CredentialProvider`, `ApiKeyCredentialProvider` | `create-oauth2-credential-provider`, `create-api-key-credential-provider` | `aws_bedrockagentcore_oauth2_credential_provider`, `…_api_key_credential_provider` | `awscc_bedrockagentcore_o_auth_2_credential_provider`, `…_api_key_credential_provider` |
+| Agent identity | automatic | `WorkloadIdentity` | `create-workload-identity` | `aws_bedrockagentcore_workload_identity` | `awscc_bedrockagentcore_workload_identity` |
+| Policy (Cedar) | `add policy-engine`, `add policy` | `PolicyEngine`, `Policy` | `create-policy-engine`, `create-policy` | `aws_bedrockagentcore_policy_engine`, `…_policy` | `awscc_bedrockagentcore_policy_engine`, `…_policy` |
+| Memory | `add memory` (or `--memory-mode managed` on a harness) | `Memory` | `create-memory` / `create-event`, `retrieve-memory-records` | `aws_bedrockagentcore_memory`, `…_memory_strategy` | `awscc_bedrockagentcore_memory` |
+| Code Interpreter / Browser | a tool on the harness | `CodeInterpreterCustom`, `BrowserCustom` | `create-code-interpreter`, `create-browser` / `start-code-interpreter-session`, `invoke-code-interpreter` | `aws_bedrockagentcore_code_interpreter`, `…_browser` | `awscc_bedrockagentcore_code_interpreter_custom`, `…_browser_custom` |
+| Evaluations | `add evaluator`, `add online-eval`, `run eval` | `Evaluator`, `OnlineEvaluationConfig`, `Dataset` | `create-evaluator`, `create-online-evaluation-config`, `create-dataset` / `start-batch-evaluation` | `aws_bedrockagentcore_evaluator`, `…_online_evaluation_config` | `awscc_bedrockagentcore_evaluator`, `…_online_evaluation_config` |
+| Resource policy | – | `ResourcePolicy` | `put-resource-policy` | `aws_bedrockagentcore_resource_policy` | `awscc_bedrockagentcore_resource_policy` |
+
+- **Which provider:** `hashicorp/aws` has hand-written resources. `awscc` is generated from CloudFormation, so it gets new types first (e.g. capacity providers, configuration bundles, gateway rate limits, payments).
+- **Registry caveat:** `aws_bedrockagentcore_registry` exists, but the Registry is moving to its own `agent-registry` API and the old one shuts down 2026-10-30. **[verify]** which API the Terraform resource calls before using it.
+
+**The walkthrough's harness in Terraform** (`hashicorp/aws` 6.66):
+
+```hcl
+resource "aws_iam_role" "helpdesk" {
+  name = "helpdesk-agent"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{ Effect = "Allow", Action = "sts:AssumeRole",
+                   Principal = { Service = "bedrock-agentcore.amazonaws.com" } }]
+  })
+}
+# + policies: bedrock:InvokeModel* on the model/profile, s3:GetObject on the skills bucket, logs
+
+resource "aws_bedrockagentcore_harness" "helpdesk" {
+  harness_name       = "helpdesk"
+  execution_role_arn = aws_iam_role.helpdesk.arn
+
+  model {
+    bedrock_model_config { model_id = "global.anthropic.claude-sonnet-4-6" }
+  }
+  system_prompt { text = file("${path.module}/system-prompt.md") }
+
+  skill { s3 { uri = "s3://fintech-agent-skills/expense-policy/" } }
+
+  tool {
+    type = "remote_mcp"
+    name = "tickets"
+    config { remote_mcp { url = "https://tools.fintech.example/mcp" } }
+  }
+  tool {
+    type = "agentcore_code_interpreter"
+    name = "code"
+  }
+
+  max_iterations  = 20
+  timeout_seconds = 600
+}
+```
+
+**Which tool when:**
+
+| Tool | Use it for |
+|---|---|
+| **`agentcore` CLI** | Development: scaffolding, `dev`, quick deploys, invoking, logs, evals |
+| **CDK** (what the CLI generates) | Keeping the CLI's defaults (roles, builds) in real infrastructure code |
+| **Terraform** | Platform teams that already run Terraform: harnesses, gateways, policies and identities next to the rest of the account setup |
+| **AWS CLI / SDK** | Scripts, CI checks, and **invoking** agents from other services |
+
+For a code agent, Terraform needs the artifact to exist first: build and push the container, or upload the zip to S3, in CI, then point `agent_runtime_artifact` at it. The CLI hides that build step.
+
+---
+
+## 4. Strands in five minutes
 
 Strands is the loop both options above run on (the harness always; Runtime if you choose it).
 
@@ -353,7 +481,7 @@ That cycle is the whole "agent".
 
 ---
 
-## 4. The platform pieces you add next
+## 5. The platform pieces you add next
 
 Each piece is independent. You add them with `agentcore add …` and connect them to a harness or runtime.
 
@@ -410,13 +538,37 @@ when {
 - Start in `LOG_ONLY` mode, then switch to `ENFORCE`.
 - Bedrock **Guardrails** (content filters, prompt-injection detection, PII masking) can run inside the same policy step on tool inputs and outputs.
 
-### Memory
+### Conversations and memory
 
-**AgentCore Memory** (`--memory-mode managed` on a harness, or the Memory session manager in Strands) has two parts:
-- **Short-term:** stores the conversation per user and session.
-- **Long-term:** extracts facts, preferences, summaries and episodes, which the agent retrieves in later sessions.
+**Where a conversation thread lives.** Pick one of three places:
 
-Key it by our stable user id, not the email address.
+| Where | How | Survives the session? |
+|---|---|---|
+| **The session VM's memory** | The default for the harness and our templates: the Strands `Agent` keeps its message list in memory | No. It is gone after 15 minutes idle or 8 hours |
+| **Your application** | The caller stores the messages (e.g. in DynamoDB) and sends them with each call. `InvokeHarness` accepts a `messages` list | Yes. The agent itself stays stateless |
+| **AgentCore Memory (short-term)** | Each message is stored as an *event*, keyed by user (`actorId`) and session. Enable it with `--memory-mode managed` on a harness (`--memory-messages-count` = how many recent messages to load), or with the AgentCore Memory session manager in Strands | Yes. Managed by AWS, with configurable expiry |
+
+Use the VM for short chats. Use Memory or your own store when a thread must outlive a session, for example a long wait for an approval.
+
+**Long-term memory.** AgentCore Memory can also extract facts, preferences, summaries and episodes from conversations. The agent retrieves them in later sessions. Key memory by our stable user id, not the email address.
+
+**Forking a conversation** (branching from an earlier point):
+- **With Memory:** write the next event with a `branch` (a name plus the id of the event to branch from). Both branches keep their own history, and `ListEvents` reads one branch.
+- **With your own store:** copy the messages up to the fork point into a new thread and start a new session id.
+
+**Keeping token costs down with the prompt cache.** Every model call resends the whole conversation, so this matters. Bedrock can cache the **start** of a request: the system prompt, then the tool definitions, then earlier messages.
+- **Price:** a cached read costs about **10% of the input price**. Writing the cache costs more than a normal read: 125% of the input price for a 5-minute cache, about 200% for a 1-hour cache.
+- **Turning it on:**
+  - in Strands: `BedrockModel(cache_config=CacheConfig(strategy="auto"))`, which our Strands template uses;
+  - in raw `Converse`: `cachePoint` blocks.
+  - Whether the harness caches automatically is **[verify]**; check `cacheReadInputTokens` in its traces.
+- **What keeps the cache hitting:**
+  1. **Same system prompt and tools for everyone.** Put per-user details (like the user's first name) in the **first user message**, never in the system prompt. Our templates already do this.
+  2. **Stable tool list and order.** Every tool definition is part of the cached prefix.
+  3. **Append-only history.** Trimming or summarizing old messages changes the start of the prompt and causes a full cache miss. Trim rarely, in big steps.
+  4. **Long enough prefix.** Below the model's minimum (1,024 tokens for Sonnet 4.6, 4,096 for Haiku 4.5) nothing is cached.
+  5. **1-hour TTL when the agent pauses.** Use it if the agent waits more than 5 minutes, e.g. for an approval.
+- **Other token levers:** fewer tools per agent (unused tool definitions still cost tokens), `--max-tokens` / `--max-iterations` limits, and a cheaper model for simple agents (§6).
 
 ### Built-in sandboxes
 
@@ -433,11 +585,11 @@ Both are tools the agent calls; they are separate from the agent's own VM.
 
 ### Registry
 
-The **AWS Agent Registry** is a catalogue of approved agents, tools, skills and MCP servers, with an approval step. In a self-service platform it is the list of what people may use (§6).
+The **AWS Agent Registry** is a catalogue of approved agents, tools, skills and MCP servers, with an approval step. In a self-service platform it is the list of what people may use (§7).
 
 ---
 
-## 5. What you pay for
+## 6. What you pay for
 
 **Nothing is charged while an agent sits idle.** Costs start when a session runs. In practice, **model tokens are 80–96% of the bill**.
 
@@ -481,7 +633,7 @@ Runtime, Gateway, Policy and Identity are rounding errors by comparison.
 
 ---
 
-## 6. Putting it together: a self-service agent platform
+## 7. Putting it together: a self-service agent platform
 
 **Goal:**
 - Employees create agents themselves, from harness configs or our templates.
@@ -497,7 +649,7 @@ flowchart TB
   CI --> REG["Agent Registry (approved agents, tools, skills)"]
   USER["User (Auth0 login)"] -->|"JWT"| GW
   CHAT["Slack / Teams bot"] -->|"user's Auth0 token"| GW
-  EVT["EventBridge rule"] --> SF["Step Functions"]
+  EVT["EventBridge rule"] --> SF["Lambda"]
   CRON["EventBridge Scheduler (cron)"] --> SF
   SF -->|"Auth0 M2M token"| GW
   GW["AgentCore Gateway: auth, rate limits, WAF, Policy"] --> RT["Harness or Runtime agent (one VM per session)"]
@@ -514,23 +666,50 @@ flowchart TB
 |---|---|
 | **Live prompt** (web, IDE) | User signs in with Auth0 → Gateway → agent; answers stream back. One session per conversation |
 | **Chat message** (Slack, Teams) | The bot verifies the message, maps the chat user to their Auth0 user (they link accounts once) and calls the Gateway with that user's token |
-| **Event** | EventBridge rule → Step Functions → Gateway with the Auth0 M2M token of that workload. Or use the native Step Functions **harness step**, which authenticates with IAM. Step Functions gives retries, timeouts and a human-approval wait |
-| **Schedule** | EventBridge Scheduler (cron) → Step Functions → as for events. AgentCore has no built-in scheduler |
+| **Event** | EventBridge rule → **Lambda** → Gateway, with the Auth0 M2M token of that workload |
+| **Schedule** | EventBridge Scheduler (cron) → Lambda → as for events. AgentCore has no built-in scheduler |
 
-**Rules we apply:**
-- **One front door.** The Gateway, with runtimes set to accept only Gateway traffic. Rate limits, WAF, Policy and audit then apply to everyone.
-- **Automation identity.** Scheduled and event runs act as their own Auth0 M2M application, never with a stored user token. If a trigger carries a user, the agent uses on-behalf-of exchange for that user.
-- **Registry approval.** Nothing appears in the portal until its Registry record is approved. Publishing needs a second person.
-- **Budgets on every agent:**
-  - run limits (`--max-iterations`, `--max-tokens` on a harness; `RunGuard` in our templates);
-  - Gateway rate limits per user;
-  - an AWS Budget per agent tag;
-  - a kill switch.
-- **Model allowlist.** Every Bedrock model can be called by default, so an SCP allows only approved models. Use geo (`eu.`) profiles where data residency matters.
+**Long runs and approvals, without extra services:**
+- **The Lambda only starts the run.** If the agent needs more than Lambda's 15 minutes, it replies "accepted" at once and keeps working in its own session as a background task (up to 8 hours). It reports the result on a queue or to the chat.
+- **Approvals are part of the conversation.** The agent replies `approval_required`. The approver answers later, through the portal or chat, as a normal message in the same thread. If that can take hours, store the thread (§5, *Conversations and memory*) so the answer can resume it in a new session.
+
+### A coding agent
+
+A coding agent needs:
+- a **workspace** (a checked-out repo, dependencies, build output);
+- **git credentials**;
+- a place to **run untrusted commands** (tests, builds);
+- often more time than a chat turn.
+
+On AgentCore that looks like this:
+
+```mermaid
+flowchart LR
+  TRIG["Issue / PR comment / chat / schedule"] --> INV["Lambda"]
+  INV -->|"Auth0 token, session = task id"| AG["Coding agent<br/>(harness with shell/file tools, or our template on Runtime)"]
+  AG -->|"InvokeAgentRuntimeCommand:<br/>git clone, install, test"| WS["Session microVM<br/>/workspace"]
+  WS --- FS["Persistent workspace<br/>S3 Files or EFS mount (VPC mode),<br/>or session storage (preview)"]
+  AG -->|"short-lived Git token"| ID["Identity token vault<br/>(GitHub/GitLab OAuth or App credential)"]
+  AG -->|"run untrusted code"| CI["Code Interpreter<br/>(network-free sandbox)"]
+  AG -->|"MCP: open PR, comment"| GW["Gateway → Git provider API"]
+  GW --> PR["Pull request → human review"]
+```
+
+**How the pieces are used:**
+- **Workspace.** The session VM's disk disappears when the session ends. Mount **S3 Files or EFS** (VPC mode) when a workspace must survive between sessions or be shared. Session storage (1 GB, kept 14 days) is simpler but still preview.
+- **Git access.**
+  - Clone and push with a **short-lived token** from the Identity token vault (an OAuth or GitHub-App credential provider), fetched when needed. Never put a long-lived token in environment variables.
+  - The agent pushes to a branch and opens a **pull request** through a Gateway tool. A human merges.
+- **Running code.**
+  - Deterministic steps (clone, install, run tests) go through `InvokeAgentRuntimeCommand` or the agent's shell tool, inside its own VM.
+  - Code you don't trust goes to **Code Interpreter** in sandbox mode (no network).
+  - Restrict the agent VM's own network with VPC egress rules.
+- **Time.** A Runtime session lasts up to **8 hours**. Runtime Instances (EC2 in your account) allow up to **14 days** for very long jobs.
+- **Guards.** Commands are allowed as an argv list only (no shell strings from the model), with limits on turns and cost. Our coding-agent design is in [`templates/README.md`](templates/README.md) (execution environment section).
 
 ---
 
-## 7. How the other vendors compare
+## 8. How the other vendors compare
 
 | Part | AWS | Google Cloud | Microsoft Azure | Anthropic | OpenAI |
 |---|---|---|---|---|---|
@@ -551,7 +730,7 @@ flowchart TB
 
 ---
 
-## 8. Don't use
+## 9. Don't use
 
 - **Bedrock Agents ("Agents Classic")**: closed to new customers. Use the harness or Runtime.
 - **The Starter Toolkit CLI** (`pip install bedrock-agentcore-starter-toolkit`): unsupported. Both it and the new CLI install a command called `agentcore`, so uninstall it.
