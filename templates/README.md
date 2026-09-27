@@ -88,6 +88,37 @@ npm ci --ignore-scripts
 npm test
 ```
 
+## Pilot status (generic-agents)
+
+Checked on 2026-09-27. All tests run offline against scripted fake models. Python uses `mypy --strict` and `ruff`; TypeScript uses `tsc` strict. "Image smoke test" means an x86 local build with these checks: `/ping`, invalid request, no email in the token, refused cancel, non-root uid 1000.
+
+| Package | Tests | Types / lint | Image smoke test |
+|---|---|---|---|
+| `shared/python` (org_agents) | 36 | clean | n/a |
+| `shared/pydantic-harness` | 50 | clean | n/a |
+| `shared/ts/org-agents` | 72 | clean | n/a |
+| `generic-agents/tools` | 11 | clean | n/a |
+| `strands-sdk` | 19 | clean | yes |
+| `strands-harness` | 23 | clean | yes, before identity |
+| `pydantic-sdk` | 31 | clean | yes, before identity |
+| `pydantic-harness` | 19 | clean | yes, before identity |
+| `langgraph-sdk` | 33 | clean | yes, before identity |
+| `langgraph-harness` | 31 | clean | yes, before identity |
+| `pi-harness` | 56 | clean | yes |
+| `opencode-harness` | 30 | clean | yes |
+
+**Known gaps to decide during the pilot review:**
+- `merge_answers(RunFailed, Answer)` hides an earlier failure when queued follow-ups run after it.
+- Some helpers are duplicated across variants (Strands hooks, `describe_failure`, dangling tool-call repair). They could move into the shared libraries.
+- `RunGuard` is not thread-safe. There is one run per thread today, and one pending approval per thread.
+- The LangGraph and Pydantic SDK variants have no history window (the others trim or compact).
+- opencode binds one user per microVM and refuses prompts from other users.
+- deepagents pulls in the Anthropic and Google LangChain packages.
+- Identity:
+  - Without the Auth0 `<ns>user_id` claim, user ids are only as stable as the `UserDirectory`. That is SQLite or in-memory locally; production needs a shared store (DynamoDB) or the Action-minted claim.
+  - Session stores and model history contain first names. Ticket tool results contain requester name and email.
+  - Sliding-window trimming can drop the first-name preamble.
+
 ## Coding agents: execution environment design
 
 Coding agents need a **generic execution environment**: a workspace, command execution, test running, and git. It is designed now so that the shared controls already fit. The coding-agent templates themselves come after the pilot.
