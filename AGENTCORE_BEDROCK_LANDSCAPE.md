@@ -524,7 +524,17 @@ The full Auth0 setup is in [`AGENT_IDENTITY_AUTH0.md`](AGENT_IDENTITY_AUTH0.md).
 
 ### Policy: who may call which tool
 
-A **Policy engine** attached to the Gateway checks every tool call against **Cedar** rules. Every Auth0 claim becomes a tag you can test:
+A **Policy engine** attached to the Gateway checks every tool call against **Cedar** rules.
+
+**Cedar** is AWS's open-source language for authorization rules (also used by Amazon Verified Permissions). A rule says:
+- who (`principal`) may do what (`action`) on what (`resource`);
+- under which conditions (`when { … }`).
+
+Rules are declarative data, not code, so they are quick to check and easy to review. Two rules decide the result:
+- nothing is allowed unless a `permit` matches;
+- any matching `forbid` wins.
+
+Every Auth0 claim becomes a tag you can test:
 
 ```cedar
 permit(principal, action == AgentCore::Action::"Payments___transfer", resource)

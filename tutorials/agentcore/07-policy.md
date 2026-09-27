@@ -4,6 +4,8 @@ You will: allow or deny helpdesk tool calls on the Gateway with Cedar rules that
 
 The full, checked files are in [`examples/07-policy/`](examples/07-policy/).
 
+**What is Cedar?** Cedar is AWS's open-source language for authorization rules (Apache-2.0, [cedarpolicy.com](https://www.cedarpolicy.com/)); Amazon Verified Permissions uses it too. A rule says who (`principal`) may do what (`action`) to what (`resource`), under which conditions (`when { … }`). Rules are data, not code: they can't loop or call anything, so they are fast to evaluate and easy to review.
+
 ## Step 1: Know what a policy sees
 
 On every `tools/call`, the Gateway builds one Cedar request and asks the policy engine. Nothing else is involved.
