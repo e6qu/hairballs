@@ -1,38 +1,69 @@
-// Call the deployed helpdesk agent with the AWS SDK and print the streamed answer.
+// Call the deployed helpdesk agent with the AWS SDK and print the streamed answer (the shell).
+// Usage: AGENT_ARN=arn:... node dist/invoke.js "prompt" [session-id]
 import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import {
   BedrockAgentCoreClient,
   InvokeAgentRuntimeCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
+import { exitCode, render } from "./core.ts";
+import {
+  type AgentRuntimeArn,
+  type AnswerEvent,
+  ParseError,
+  type Prompt,
+  type SessionId,
+  parseAgentRuntimeArn,
+  parsePrompt,
+  parseSessionId,
+  parseSseLine,
+} from "./domain.ts";
 
-const AGENT_ARN = process.env.AGENT_ARN!; // arn:aws:bedrock-agentcore:eu-west-1:111122223333:runtime/...
-
-const client = new BedrockAgentCoreClient({ region: "eu-west-1" });
-
-async function ask(prompt: string, sessionId: string): Promise<void> {
+async function ask(agent: AgentRuntimeArn, session: SessionId, prompt: Prompt): Promise<number> {
+  const client = new BedrockAgentCoreClient({ region: "eu-west-1" });
   const response = await client.send(
     new InvokeAgentRuntimeCommand({
-      agentRuntimeArn: AGENT_ARN,
-      runtimeSessionId: sessionId, // same id = same VM = same conversation
+      agentRuntimeArn: agent,
+      runtimeSessionId: session, // same id = same VM = same conversation
       payload: new TextEncoder().encode(JSON.stringify({ prompt })),
       contentType: "application/json",
       accept: "text/event-stream",
       qualifier: "DEFAULT",
     }),
   );
+  const events: AnswerEvent[] = [];
   let buffer = "";
   for await (const chunk of response.response as Readable) {
-    buffer += String(chunk); // server-sent events: 'data: "..."' lines
+    buffer += String(chunk);
     const lines = buffer.split("\n");
     buffer = lines.pop() ?? "";
     for (const line of lines) {
-      if (line.startsWith("data: ")) process.stdout.write(String(JSON.parse(line.slice(6))));
+      const event = parseSseLine(line); // outside data -> domain type, right here
+      if (event) {
+        events.push(event);
+        process.stdout.write(render(event));
+      }
     }
   }
   process.stdout.write("\n");
+  return exitCode(events);
 }
 
-const [prompt = "hello", sessionId = randomUUID()] = process.argv.slice(2);
-await ask(prompt, sessionId);
-console.log(`session: ${sessionId}`);
+async function main(args: readonly string[]): Promise<number> {
+  let agent: AgentRuntimeArn, prompt: Prompt, session: SessionId;
+  try {
+    agent = parseAgentRuntimeArn(process.env.AGENT_ARN ?? "");
+    prompt = parsePrompt(args[0] ?? "");
+    session = parseSessionId(args[1] ?? randomUUID());
+  } catch (error) {
+    if (!(error instanceof ParseError)) throw error;
+    console.error(
+      `error: ${error.message}\nusage: AGENT_ARN=arn:... invoke.js PROMPT [SESSION_ID]`,
+    );
+    return 2;
+  }
+  console.log(`session: ${session}`);
+  return ask(agent, session, prompt);
+}
+
+process.exitCode = await main(process.argv.slice(2));

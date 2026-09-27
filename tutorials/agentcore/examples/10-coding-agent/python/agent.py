@@ -1,10 +1,10 @@
-"""A coding agent: a git checkout in a persistent workspace, a GitHub token only when needed."""
+"""The coding agent (the imperative shell): Strands tools parse their arguments, then call core."""
 
-import base64
+from __future__ import annotations
+
 import os
 import subprocess
 from collections.abc import AsyncIterator
-from pathlib import Path
 
 from bedrock_agentcore.identity.auth import requires_access_token
 from bedrock_agentcore.runtime import BedrockAgentCoreApp, RequestContext
@@ -12,18 +12,27 @@ from strands import Agent, tool
 from strands_tools import editor
 from strands_tools.code_interpreter import AgentCoreCodeInterpreter
 
-os.environ.setdefault(
-    "BYPASS_TOOL_CONSENT", "true"
-)  # no interactive prompts on a server
+from core import clone_argv, commit_steps, describe, git_env
+from domain import (
+    WORKSPACE,
+    AllowedCommand,
+    BranchName,
+    CommitMessage,
+    Finished,
+    GitHubToken,
+    Outcome,
+    ParseError,
+    Repo,
+    RepoPath,
+    TimedOut,
+)
+
+os.environ.setdefault("BYPASS_TOOL_CONSENT", "true")  # no interactive prompts on a server
 
 MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0"
 SYSTEM_PROMPT = """You are a careful software engineer working on one GitHub repository.
 Clone it, read the code, make the smallest change that fixes the task, run the tests, push a branch.
 Run code you did not write (snippets from issues, downloaded scripts) only in the code interpreter."""
-WORKSPACE = Path(
-    "/mnt/workspace"
-)  # session storage: kept across stop/resume of the session
-PROGRAMS = {"git", "ls", "cat", "grep", "npm", "npx", "node", "python", "pytest", "uv"}
 SANDBOX_ID = os.environ.get("CODE_INTERPRETER_ID", "coder_sandbox-AbCdEf1234")
 
 app = BedrockAgentCoreApp()
@@ -41,32 +50,28 @@ def ask_user_to_consent(url: str) -> None:
     on_auth_url=ask_user_to_consent,
     into="token",
 )
-async def github_token(*, token: str = "") -> str:
-    """The user's GitHub token from the token vault. Never stored, never logged."""
+async def vault_token(*, token: str = "") -> str:
     return token
 
 
-def repo_dir(repo: str) -> Path:
-    path = (WORKSPACE / repo.split("/")[-1]).resolve()
-    if path.parent != WORKSPACE:
-        raise ValueError(f"not a repository name: {repo}")
-    return path
+async def github_token() -> GitHubToken:
+    """The user's GitHub token from the token vault, parsed at the boundary."""
+    return GitHubToken.parse(await vault_token())
 
 
-async def git(args: list[str], cwd: Path) -> str:
-    """Run git with the token in the child's environment only: not in argv, files or logs."""
-    basic = base64.b64encode(f"x-access-token:{await github_token()}".encode()).decode()
-    env = {
-        **os.environ,
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
-    }
-    done = subprocess.run(
-        ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=600
-    )
-    return f"exit {done.returncode}\n{(done.stdout + done.stderr)[-4000:]}"
+def execute(argv: list[str], cwd: str, env: dict[str, str] | None = None) -> Outcome:
+    try:
+        done = subprocess.run(
+            argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=900, check=False
+        )
+    except subprocess.TimeoutExpired as exc:
+        return TimedOut(str(exc.output or ""))
+    return Finished(done.returncode, done.stdout + done.stderr)
+
+
+async def git_with_token(argv: list[str], cwd: str) -> str:
+    env = {**os.environ, **git_env((await github_token()).value)}
+    return describe(execute(argv, cwd, env))
 
 
 @tool
@@ -76,9 +81,12 @@ async def clone(repo: str) -> str:
     Args:
         repo: owner/name, for example fintech/helpdesk-api.
     """
-    WORKSPACE.mkdir(parents=True, exist_ok=True)
-    url = f"https://github.com/{repo}.git"
-    return await git(["clone", url, str(repo_dir(repo))], WORKSPACE)
+    try:
+        target = Repo.parse(repo)  # tool arguments from the model -> domain type
+    except ParseError as exc:
+        return f"refused: {exc}"
+    os.makedirs(WORKSPACE, exist_ok=True)
+    return await git_with_token(clone_argv(target), str(WORKSPACE))
 
 
 @tool
@@ -90,26 +98,32 @@ async def push(repo: str, branch: str, message: str) -> str:
         branch: new branch name, for example fix/issue-42.
         message: the commit message.
     """
-    cwd = repo_dir(repo)
-    for args in (["switch", "-c", branch], ["add", "-A"], ["commit", "-m", message]):
-        subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
-    return await git(["push", "origin", branch], cwd)
+    try:
+        path = str(RepoPath.of(Repo.parse(repo)).path)
+        new_branch, text = BranchName.parse(branch), CommitMessage.parse(message)
+    except ParseError as exc:
+        return f"refused: {exc}"
+    for step in commit_steps(new_branch, text):
+        outcome = execute(step, path)
+        if not (isinstance(outcome, Finished) and outcome.exit_code == 0):
+            return describe(outcome)
+    return await git_with_token(["git", "push", "origin", new_branch.value], path)
 
 
 @tool
 def run(repo: str, argv: list[str]) -> str:
-    """Run one program in a cloned repository, for example ["npm", "test"]. No shell.
+    """Run one allowed program in a cloned repository, for example ["npm", "test"]. No shell.
 
     Args:
         repo: owner/name of a cloned repository.
         argv: the program and its arguments.
     """
-    if not argv or argv[0] not in PROGRAMS:
-        return f"not allowed; use one of {sorted(PROGRAMS)}"
-    done = subprocess.run(
-        argv, cwd=repo_dir(repo), capture_output=True, text=True, timeout=900
-    )
-    return f"exit {done.returncode}\n{(done.stdout + done.stderr)[-4000:]}"
+    try:
+        path = RepoPath.of(Repo.parse(repo))
+        command = AllowedCommand.parse(argv)
+    except ParseError as exc:
+        return f"refused: {exc}"
+    return describe(execute(command.argv, str(path.path)))
 
 
 sandbox = AgentCoreCodeInterpreter(region="eu-west-1", identifier=SANDBOX_ID)
@@ -127,9 +141,7 @@ def agent_for(session_id: str) -> Agent:
 
 
 @app.entrypoint
-async def invoke(
-    payload: dict[str, str], context: RequestContext
-) -> AsyncIterator[str]:
+async def invoke(payload: dict[str, str], context: RequestContext) -> AsyncIterator[str]:
     agent = agent_for(context.session_id or "local")
     async for event in agent.stream_async(payload["prompt"]):
         if "data" in event:

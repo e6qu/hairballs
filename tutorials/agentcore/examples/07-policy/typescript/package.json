@@ -4,11 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/call_tool.js"
+    "call-tool": "tsx call_tool.ts"
   },
   "devDependencies": {
     "@types/node": "22.20.4",
+    "tsx": "4.23.15",
     "typescript": "5.9.3"
   }
 }

@@ -1,88 +1,77 @@
-"""Lambda: EventBridge rule or Scheduler -> the helpdesk agent, with an Auth0 M2M token.
+"""Lambda: EventBridge rule or Scheduler -> the helpdesk agent (the imperative shell).
 
-Uses only the standard library and boto3, which the Lambda Python runtime already has.
+Deploy handler.py with domain.py and core.py. It needs only boto3, which the Lambda runtime has.
 """
 
-import hashlib
+from __future__ import annotations
+
 import json
 import os
 import time
 import urllib.parse
 import urllib.request
-from typing import TypedDict, cast
 
 import boto3
 
-REGION = os.environ.get("AWS_REGION", "eu-west-1")
-# The helpdesk Runtime agent, JWT inbound (tutorial 06)
-AGENT_ARN = os.environ["AGENT_ARN"]
-# The Auth0 M2M app "agent-scheduler", and the Secrets Manager secret with its client secret
-AUTH0_CLIENT_ID = os.environ["AUTH0_CLIENT_ID"]
-AUTH0_SECRET_ID = os.environ["AUTH0_SECRET_ID"]
+from core import session_id_for, task_for, usable
+from domain import (
+    Accepted,
+    CachedToken,
+    Config,
+    SessionId,
+    Task,
+    parse_agent_reply,
+    parse_config,
+    parse_token_response,
+    parse_trigger,
+)
+
 AUTH0_TOKEN_URL = "https://fintech.eu.auth0.com/oauth/token"
 AUDIENCE = "https://agents.fintech.example"
 
-
-class Event(TypedDict):
-    id: str
-    source: str
-    detail: dict[str, str]
+_cached: CachedToken | None = None  # lives as long as this Lambda instance
 
 
-class TokenReply(TypedDict):
-    access_token: str
-    expires_in: int
-
-
-_token = ""
-_token_expires = 0.0
-
-
-def m2m_token() -> str:
-    """Client-credentials token, cached for as long as this Lambda instance lives."""
-    global _token, _token_expires
-    if time.time() < _token_expires - 60:
-        return _token
+def m2m_token(config: Config) -> CachedToken:
+    """Client-credentials token, fetched once per instance and reused until it nearly expires."""
+    global _cached
+    token = usable(_cached, time.time())
+    if token is not None:
+        return token
     secrets = boto3.client("secretsmanager")
-    client_secret = secrets.get_secret_value(SecretId=AUTH0_SECRET_ID)["SecretString"]
+    secret = secrets.get_secret_value(SecretId=config.secret_id)["SecretString"]
     form = {
         "grant_type": "client_credentials",
-        "client_id": AUTH0_CLIENT_ID,
-        "client_secret": client_secret,
+        "client_id": config.client_id,
+        "client_secret": secret,
         "audience": AUDIENCE,
     }
     body = urllib.parse.urlencode(form).encode()
     with urllib.request.urlopen(AUTH0_TOKEN_URL, body, timeout=10) as response:
-        reply = cast(TokenReply, json.load(response))
-    _token, _token_expires = reply["access_token"], time.time() + reply["expires_in"]
-    return _token
+        _cached = parse_token_response(json.load(response), now=time.time())
+    return _cached
 
 
-def session_id(event: Event) -> str:
-    """Same event -> same session id. A retried delivery reaches the same agent session."""
-    return hashlib.sha256(f"{event['source']}:{event['id']}".encode()).hexdigest()
-
-
-def prompt_for(event: Event) -> str:
-    if event["source"] == "fintech.tickets":
-        return f"Ticket {event['detail']['ticketId']} was escalated. Triage it and add a note."
-    return "Write the daily digest of open high-priority tickets and post it as a note."
-
-
-def handler(event: Event, context: object) -> dict[str, str]:
-    arn = urllib.parse.quote(AGENT_ARN, safe="")
-    url = f"https://bedrock-agentcore.{REGION}.amazonaws.com/runtimes/{arn}/invocations?qualifier=DEFAULT"
+def start(config: Config, token: CachedToken, session: SessionId, task: Task) -> Accepted:
+    arn = urllib.parse.quote(config.agent.value, safe="")
+    host = f"https://bedrock-agentcore.{config.region}.amazonaws.com"
     request = urllib.request.Request(
-        url,
-        data=json.dumps({"taskId": event["id"], "prompt": prompt_for(event)}).encode(),
+        f"{host}/runtimes/{arn}/invocations?qualifier=DEFAULT",
+        data=json.dumps({"taskId": task.task_id, "prompt": task.prompt}).encode(),
         headers={
-            "Authorization": f"Bearer {m2m_token()}",
+            "Authorization": f"Bearer {token.value}",
             "Content-Type": "application/json",
-            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id(event),
+            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session.value,
         },
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=30) as response:
-        reply: dict[str, str] = json.load(response)
-    print(json.dumps({"event": event["id"], "agent": reply}))
-    return reply  # {"status": "accepted", ...}: the agent keeps working on its own
+        return parse_agent_reply(json.load(response))
+
+
+def handler(event: object, context: object) -> dict[str, str]:
+    config = parse_config(os.environ)
+    trigger = parse_trigger(event)  # outside data -> domain type, right here
+    reply = start(config, m2m_token(config), session_id_for(trigger.ref), task_for(trigger))
+    print(json.dumps({"taskId": reply.task_id, "state": reply.state.value}))
+    return {"taskId": reply.task_id, "state": reply.state.value}  # the agent keeps working

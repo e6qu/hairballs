@@ -1,4 +1,5 @@
-// Drive one coding task: the agent does the reasoning; tests and the pull request are plain steps.
+// Drive one coding task (the imperative shell): the agent reasons; tests and the PR are plain steps.
+// Usage: AGENT_ARN=arn:... USER_ID=usr_... USER_TOKEN=<Auth0 token> npm run workflow
 import { randomUUID } from "node:crypto";
 import type { Readable } from "node:stream";
 import {
@@ -6,22 +7,43 @@ import {
   InvokeAgentRuntimeCommand,
   InvokeAgentRuntimeCommandCommand,
 } from "@aws-sdk/client-bedrock-agentcore";
+import { afterTests, pullRequestArguments, taskSession } from "./core.ts";
+import {
+  type AgentArn,
+  type Outcome,
+  type PullRequest,
+  type PullRequestReply,
+  type SessionId,
+  type UserId,
+  type UserToken,
+  ParseError,
+  parseAgentArn,
+  parseBranchName,
+  parseCommandEvent,
+  parsePullRequestReply,
+  parseRepo,
+  parseUserId,
+  parseUserToken,
+} from "./domain.ts";
 
-const AGENT_ARN =
-  process.env.AGENT_ARN ??
-  "arn:aws:bedrock-agentcore:eu-west-1:111122223333:runtime/coder-AbCdEf1234";
 const GATEWAY_URL =
   "https://helpdesk-tools-abc123xyz.gateway.bedrock-agentcore.eu-west-1.amazonaws.com/mcp";
+const MAX_ATTEMPTS = 3;
 
 const client = new BedrockAgentCoreClient({ region: "eu-west-1" });
 
-/** One agent turn. userId selects whose GitHub token the agent may fetch. */
-async function ask(prompt: string, sessionId: string, userId: string): Promise<string> {
+// One agent turn. The user id selects whose GitHub token the agent may fetch.
+async function ask(
+  agent: AgentArn,
+  session: SessionId,
+  user: UserId,
+  prompt: string,
+): Promise<string> {
   const response = await client.send(
     new InvokeAgentRuntimeCommand({
-      agentRuntimeArn: AGENT_ARN,
-      runtimeSessionId: sessionId,
-      runtimeUserId: userId, // needs bedrock-agentcore:InvokeAgentRuntimeForUser
+      agentRuntimeArn: agent,
+      runtimeSessionId: session,
+      runtimeUserId: user, // needs bedrock-agentcore:InvokeAgentRuntimeForUser
       payload: new TextEncoder().encode(JSON.stringify({ prompt })),
     }),
   );
@@ -34,61 +56,72 @@ async function ask(prompt: string, sessionId: string, userId: string): Promise<s
     .join("");
 }
 
-/** Run a command in the agent's VM: no model, no tokens. Returns the exit code. */
-async function sh(command: string, sessionId: string, timeout = 900): Promise<number> {
+// Run a command in the agent's VM: no model, no tokens.
+async function sh(
+  agent: AgentArn,
+  session: SessionId,
+  command: string,
+  timeout = 900,
+): Promise<Outcome> {
   const response = await client.send(
     new InvokeAgentRuntimeCommandCommand({
-      agentRuntimeArn: AGENT_ARN,
-      runtimeSessionId: sessionId,
+      agentRuntimeArn: agent,
+      runtimeSessionId: session,
       body: { command: `/bin/bash -c "${command}"`, timeout },
     }),
   );
-  for await (const event of response.stream ?? []) {
-    const chunk = event.chunk;
-    if (chunk?.contentDelta) {
-      process.stdout.write((chunk.contentDelta.stdout ?? "") + (chunk.contentDelta.stderr ?? ""));
-    }
-    if (chunk?.contentStop) return chunk.contentStop.exitCode ?? -1;
+  for await (const raw of response.stream ?? []) {
+    const event = parseCommandEvent(raw); // outside data -> domain type, right here
+    if (event?.kind === "output") process.stdout.write(event.text);
+    else if (event) return event;
   }
-  return -1;
+  throw new ParseError("the command stream ended without an exit code");
 }
 
-/** Call the GitHub tool behind the Gateway, as the user (tutorials 03, 06, 07). */
-async function openPullRequest(args: Record<string, string>, userToken: string): Promise<string> {
+// Call the GitHub tool behind the Gateway, as the user (tutorials 03, 06, 07).
+async function openPullRequest(pr: PullRequest, token: UserToken): Promise<PullRequestReply> {
   const response = await fetch(GATEWAY_URL, {
     method: "POST",
-    headers: { Authorization: `Bearer ${userToken}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: 1,
       method: "tools/call",
-      params: { name: "github___create_pull_request", arguments: args },
+      params: { name: "github___create_pull_request", arguments: pullRequestArguments(pr) },
     }),
   });
-  return JSON.stringify(((await response.json()) as { result: unknown }).result);
+  return parsePullRequestReply(await response.json());
 }
 
-const session = `coder-issue-42-${randomUUID()}`; // one session (and workspace) per task
-const user = process.env.USER_ID!; // who asked; taken from their verified Auth0 token
-console.log(await ask("Fix issue 42 in fintech/helpdesk-api. Clone it first.", session, user));
+async function main(): Promise<number> {
+  const agent = parseAgentArn(process.env.AGENT_ARN ?? "");
+  const user = parseUserId(process.env.USER_ID ?? ""); // from their verified Auth0 token
+  const token = parseUserToken(process.env.USER_TOKEN ?? "");
+  const repo = parseRepo("fintech/helpdesk-api");
+  const branch = parseBranchName("fix/issue-42");
+  const session = taskSession("issue-42", randomUUID()); // one session (and workspace) per task
+  console.log(
+    await ask(agent, session, user, `Fix issue 42 in ${repo.owner}/${repo.name}. Clone it first.`),
+  );
 
-const tests = "cd /mnt/workspace/helpdesk-api && npm ci && npm test";
-let passed = false;
-for (let i = 0; i < 3 && !passed; i++) {
-  // the test run decides, not the model
-  passed = (await sh(tests, session)) === 0;
-  if (!passed) {
-    console.log(await ask("The tests fail. Run them, read the output, fix it.", session, user));
+  const tests = `cd /mnt/workspace/${repo.name} && npm ci && npm test`;
+  for (let attempt = 0; ; ) {
+    const next = afterTests(await sh(agent, session, tests), attempt, MAX_ATTEMPTS);
+    if (next.kind === "done") break;
+    if (next.kind === "giveUp") {
+      console.error("tests still fail: a human takes over");
+      return 1;
+    }
+    attempt = next.attempt;
+    console.log(
+      await ask(agent, session, user, "The tests fail. Run them, read the output, fix it."),
+    );
   }
-}
-if (!passed) throw new Error("tests still fail: a human takes over");
 
-console.log(await ask("Push the change to a new branch fix/issue-42.", session, user));
-const pr = {
-  owner: "fintech",
-  repo: "helpdesk-api",
-  title: "Fix issue 42",
-  head: "fix/issue-42",
-  base: "main",
-};
-console.log(await openPullRequest(pr, process.env.USER_TOKEN!));
+  console.log(await ask(agent, session, user, `Push the change to a new branch ${branch}.`));
+  const pr = { repo, head: branch, base: parseBranchName("main"), title: "Fix issue 42" };
+  console.log(await openPullRequest(pr, token));
+  return 0;
+}
+
+process.exitCode = await main();

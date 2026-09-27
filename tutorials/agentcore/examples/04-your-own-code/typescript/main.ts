@@ -1,8 +1,10 @@
-// The helpdesk agent as code: a Strands agent inside an AgentCore Runtime app.
+// The helpdesk agent as code: a Strands agent inside an AgentCore Runtime app (the shell).
 import { randomUUID } from "node:crypto";
 import { Agent, tool } from "@strands-agents/sdk";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 import { z } from "zod";
+import { newTicketId, ticketLogLine } from "./core.ts";
+import { type SessionId, parseInvocation, parseSessionId, parseTicketRequest } from "./domain.ts";
 
 const MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0";
 const SYSTEM_PROMPT = `You are the internal IT and expenses helpdesk for Fintech Ltd.
@@ -17,29 +19,30 @@ const createTicket = tool({
     description: z.string().describe("What the user needs, in their own words."),
   }),
   callback: ({ title, description }) => {
-    const ticketId = `TCK-${randomUUID().slice(0, 8)}`;
-    console.log(`ticket ${ticketId}: ${title} (${description.length} chars)`);
-    return ticketId;
+    const request = parseTicketRequest(title, description); // the model's arguments -> domain type
+    const ticket = newTicketId(randomUUID().replaceAll("-", ""));
+    console.log(ticketLogLine(ticket, request));
+    return ticket;
   },
 });
 
 // One agent (and so one conversation) per session.
-const agents = new Map<string, Agent>();
-function agentFor(sessionId: string): Agent {
-  let agent = agents.get(sessionId);
+const agents = new Map<SessionId, Agent>();
+function agentFor(session: SessionId): Agent {
+  let agent = agents.get(session);
   if (!agent) {
     agent = new Agent({ model: MODEL_ID, systemPrompt: SYSTEM_PROMPT, tools: [createTicket] });
-    agents.set(sessionId, agent);
+    agents.set(session, agent);
   }
   return agent;
 }
 
 const app = new BedrockAgentCoreApp({
   invocationHandler: {
-    requestSchema: z.object({ prompt: z.string() }),
     async *process(payload, context) {
-      const agent = agentFor(context.sessionId || "local");
-      for await (const event of agent.stream(payload.prompt)) {
+      const prompt = parseInvocation(payload); // outside data -> domain types, right here
+      const session = parseSessionId(context.sessionId);
+      for await (const event of agentFor(session).stream(prompt)) {
         if (
           event.type === "modelStreamUpdateEvent" &&
           event.event.type === "modelContentBlockDeltaEvent" &&

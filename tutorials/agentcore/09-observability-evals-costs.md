@@ -50,69 +50,112 @@ Model tokens are 80–96% of the bill, so count them where you call the agent. T
 - `cacheWriteInputTokens` cost 125% of the input price (5-minute cache).
 - `inputTokens` are the uncached input tokens.
 
+The code has the same three parts as in [01](01-first-agent.md):
+
+- **`domain`**: `TokenUsage` (four counts, each parsed as an integer `>= 0`), `Prices` (Haiku 4.5, as `Decimal` in Python and integer nano-dollars in TypeScript: money is never a float), and a `StreamEvent` union (`TextDelta | UsageReported | Stopped`). Each stream event, including its `metadata`, is parsed at the boundary.
+- **`core`**: pure functions: `total`, `cost_usd` / `cost`, `cache_hit_ratio`, `render`.
+- **shell** (`usage`): calls `InvokeHarness`, parses each event, prints.
+
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
+The shell (`usage.py`):
+
 ```python
-def ask(prompt: str, session_id: str) -> dict[str, int]:
+def ask(harness: HarnessArn, session: SessionId, question: str) -> list[StreamEvent]:
+    client = boto3.client("bedrock-agentcore", region_name="eu-west-1")
     response = client.invoke_harness(
-        harnessArn=HARNESS_ARN,
-        runtimeSessionId=session_id,
-        messages=[{"role": "user", "content": [{"text": prompt}]}],
+        harnessArn=harness.value,
+        runtimeSessionId=session.value,
+        messages=[{"role": "user", "content": [{"text": question}]}],
     )
-    totals = dict.fromkeys(PRICE, 0)
-    for event in response["stream"]:
-        if "contentBlockDelta" in event:
-            delta = event["contentBlockDelta"]["delta"]
-            print(delta.get("text", ""), end="", flush=True)
-        elif "metadata" in event:  # token usage of the model calls
-            usage = event["metadata"]["usage"]
-            totals["inputTokens"] += usage["inputTokens"]
-            totals["outputTokens"] += usage["outputTokens"]
-            totals["cacheReadInputTokens"] += usage.get("cacheReadInputTokens", 0)
-            totals["cacheWriteInputTokens"] += usage.get("cacheWriteInputTokens", 0)
-        elif "messageStop" in event:
-            print(f"\n[stop: {event['messageStop']['stopReason']}]")
-    return totals
+    events: list[StreamEvent] = []
+    for raw in response["stream"]:
+        event = parse_stream_event(raw)  # stream metadata -> TokenUsage, right here
+        if event is not None:
+            events.append(event)
+            print(render(event), end="", flush=True)
+    return events
 ```
 
 </td><td>
 
+The shell (`usage.ts`):
+
 ```typescript
-async function ask(prompt: string, sessionId: string): Promise<Totals> {
+async function ask(
+  harness: HarnessArn,
+  session: SessionId,
+  question: string,
+): Promise<StreamEvent[]> {
+  const client = new BedrockAgentCoreClient({ region: "eu-west-1" });
   const response = await client.send(
     new InvokeHarnessCommand({
-      harnessArn: HARNESS_ARN,
-      runtimeSessionId: sessionId,
-      messages: [{ role: "user", content: [{ text: prompt }] }],
+      harnessArn: harness,
+      runtimeSessionId: session,
+      messages: [{ role: "user", content: [{ text: question }] }],
     }),
   );
-  const totals: Totals = {
-    inputTokens: 0,
-    outputTokens: 0,
-    cacheReadInputTokens: 0,
-    cacheWriteInputTokens: 0,
-  };
-  for await (const event of response.stream ?? []) {
-    if (event.contentBlockDelta) {
-      process.stdout.write(event.contentBlockDelta.delta?.text ?? "");
-    } else if (event.metadata) {
-      // token usage of the model calls
-      const usage = event.metadata.usage;
-      totals.inputTokens += usage?.inputTokens ?? 0;
-      totals.outputTokens += usage?.outputTokens ?? 0;
-      totals.cacheReadInputTokens += usage?.cacheReadInputTokens ?? 0;
-      totals.cacheWriteInputTokens += usage?.cacheWriteInputTokens ?? 0;
-    } else if (event.messageStop) {
-      console.log(`\n[stop: ${event.messageStop.stopReason}]`);
+  const events: StreamEvent[] = [];
+  for await (const raw of response.stream ?? []) {
+    const event = parseStreamEvent(raw); // stream metadata -> TokenUsage, right here
+    if (event) {
+      events.push(event);
+      process.stdout.write(render(event));
     }
   }
-  return totals;
+  return events;
+}
+```
+
+</td></tr><tr><td>
+
+The usage parser (`domain.py`) and the cost (`core.py`):
+
+```python
+def parse_usage(raw: object) -> TokenUsage:
+    usage = _fields(raw, "$.usage")
+    return TokenUsage(
+        input=_count(usage, "inputTokens"),  # uncached input
+        output=_count(usage, "outputTokens"),
+        cache_read=_count(usage, "cacheReadInputTokens"),
+        cache_write=_count(usage, "cacheWriteInputTokens"),
+    )
+
+def cost_usd(usage: TokenUsage, prices: Prices) -> Decimal:
+    return (
+        usage.input * prices.input
+        + usage.output * prices.output
+        + usage.cache_read * prices.cache_read
+        + usage.cache_write * prices.cache_write
+    ) / MILLION
+```
+
+</td><td>
+
+The usage parser (`domain.ts`) and the cost (`core.ts`):
+
+```typescript
+export function parseUsage(raw: HarnessTokenUsage | undefined): TokenUsage {
+  if (raw === undefined) throw new ParseError("$.usage: missing");
+  return {
+    input: parseCount(raw.inputTokens, "inputTokens"),
+    output: parseCount(raw.outputTokens, "outputTokens"),
+    cacheRead: parseCount(raw.cacheReadInputTokens, "cacheReadInputTokens"),
+    cacheWrite: parseCount(raw.cacheWriteInputTokens, "cacheWriteInputTokens"),
+  };
+}
+
+export function cost(usage: TokenUsage, prices: Prices): NanoUsd {
+  return (usage.input * prices.input +
+    usage.output * prices.output +
+    usage.cacheRead * prices.cacheRead +
+    usage.cacheWrite * prices.cacheWrite) as NanoUsd;
 }
 ```
 
 </td></tr></table>
 
-`usage.py` and `usage.ts` also turn the totals into dollars with the Haiku 4.5 prices. Ask the same question twice in one session: the second call should show cache reads. **[verify]** whether the stream sends one `metadata` event per model call or one per invocation; adding them up is right in both cases.
+`usage.py` and `usage.ts` print the totals, the cost and the cache hit ratio. Ask the same question twice in one session: the second call should show cache reads. **[verify]** whether the stream sends one `metadata` event per model call or one per invocation; adding them up is right in both cases.
 
 Terraform: [`aws_bedrockagentcore_harness.helpdesk`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_harness), [`aws_iam_policy.helpdesk_caller`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy) (the caller needs `InvokeHarness` and `InvokeAgentRuntime` on the harness)
 
@@ -302,41 +345,92 @@ AgentCore **Evaluations** reads a session's spans and asks a judge model to scor
 agentcore run eval --session-id "$SID" --evaluator Builtin.GoalSuccessRate Builtin.Helpfulness
 ```
 
-From code, the Python SDK collects the spans for you. In TypeScript, query them from CloudWatch Logs (`sessionSpans` in `evaluate.ts`) and pass them to `Evaluate`:
+From code, the Python SDK collects the spans for you. In TypeScript, the shell queries them from CloudWatch Logs (`spansOf` in `evaluate.ts`) and passes them to `Evaluate`. Each result is parsed into an `Evaluation` union, `Scored | NotScored`, so a missing score can't be mistaken for a zero:
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
+The shell (`evaluate.py`):
+
 ```python
-evaluations = EvaluationClient(region_name="eu-west-1")
-results = evaluations.run(
-    evaluator_ids=EVALUATORS,
-    session_id=sys.argv[1],
-    # Spans come from aws/spans and /aws/bedrock-agentcore/runtimes/<id>-DEFAULT.
-    agent_id=runtime_id(HARNESS_ID),
-)
-for result in results:
-    print(result["evaluatorId"], result.get("value"), result.get("label"))
-    print("  ", result.get("explanation", "")[:200])
+def main(argv: list[str]) -> int:
+    try:
+        session = SessionId.parse(argv[1] if len(argv) > 1 else "")
+        harness = HarnessId.parse(HARNESS_ID)
+        evaluators = [EvaluatorId.parse(e) for e in EVALUATORS]
+    except ParseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    results = EvaluationClient(region_name="eu-west-1").run(
+        evaluator_ids=[e.value for e in evaluators],
+        session_id=session.value,
+        # Spans come from aws/spans and /aws/bedrock-agentcore/runtimes/<id>-DEFAULT.
+        agent_id=runtime_of(harness).value,
+    )
+    for raw in results:
+        print(render_evaluation(parse_evaluation(raw)))  # outside data -> domain type
+    return 0
 ```
 
 </td><td>
 
+The shell (`evaluate.ts`, after `spansOf`):
+
 ```typescript
-const spans = await sessionSpans(await runtimeId(HARNESS_ID), sessionId);
-for (const evaluatorId of EVALUATORS) {
+const session = parseSessionId(process.argv[2] ?? "");
+const evaluators = ["Builtin.GoalSuccessRate", "Builtin.Helpfulness"].map(parseEvaluatorId);
+const spans = await spansOf(await runtimeOf(parseHarnessId("helpdesk-AbCdEf1234")), session);
+for (const evaluatorId of evaluators) {
   const { evaluationResults } = await agentcore.send(
-    new EvaluateCommand({ evaluatorId, evaluationInput: { sessionSpans: spans } }),
+    new EvaluateCommand({ evaluatorId, evaluationInput: { sessionSpans: [...spans] } }),
   );
-  for (const result of evaluationResults ?? []) {
-    console.log(result.evaluatorId, result.value, result.label);
-    console.log("  ", (result.explanation ?? "").slice(0, 200));
+  for (const raw of evaluationResults ?? []) console.log(renderEvaluation(parseEvaluation(raw)));
+}
+```
+
+</td></tr><tr><td>
+
+The boundary parser (`domain.py`):
+
+```python
+def parse_evaluation(raw: object) -> Evaluation:
+    """One entry of evaluationResults -> Scored, or NotScored with the service's reason."""
+    result = _fields(raw, "$")
+    evaluator = _text(result, "evaluatorId", "$")
+    value = result.get("value")
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        message = result.get("errorMessage")
+        return NotScored(evaluator, message if isinstance(message, str) else "no score")
+    label = result.get("label")
+    explanation = result.get("explanation")
+    return Scored(
+        evaluator,
+        float(value),
+        label if isinstance(label, str) else "",
+        explanation if isinstance(explanation, str) else "",
+    )
+```
+
+</td><td>
+
+The boundary parser (`domain.ts`):
+
+```typescript
+export function parseEvaluation(raw: EvaluationResultContent): Evaluation {
+  const evaluator = raw.evaluatorId ?? "unknown evaluator";
+  if (raw.value === undefined) {
+    return { kind: "notScored", evaluator, reason: raw.errorMessage ?? "no score" };
   }
+  return {
+    kind: "scored",
+    evaluator,
+    value: raw.value,
+    label: raw.label ?? "",
+    explanation: raw.explanation ?? "",
+  };
 }
 ```
 
 </td></tr></table>
-
-Terraform: [`aws_iam_policy.helpdesk_evaluator`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy) (what the code above needs: `GetHarness`, `Evaluate`, and the Logs query)
 
 Each result has a score (`value`), a `label` and the judge's `explanation`. Add ground truth when you have it: `agentcore run eval --assertion "…" --expected-trajectory tickets___create_ticket`.
 

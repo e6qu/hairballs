@@ -1,59 +1,51 @@
-// Call a Gateway tool over MCP and tell a policy denial apart from other errors.
-const GATEWAY_URL =
-  process.env.GATEWAY_URL ??
-  "https://helpdesk-tools-abc123xyz.gateway.bedrock-agentcore.eu-west-1.amazonaws.com/mcp";
-const DENIED = "AuthorizeActionException"; // the Gateway's text for a Cedar deny
+// Call a Gateway tool as the signed-in user (the imperative shell).
+// Usage: ACCESS_TOKEN=<Auth0 token> GATEWAY_URL=https://.../mcp npm run call-tool
+import { render, toolsCall } from "./core.ts";
+import {
+  type AccessToken,
+  type Decision,
+  type GatewayUrl,
+  ParseError,
+  type ToolName,
+  parseAccessToken,
+  parseGatewayUrl,
+  parseToolName,
+  parseToolReply,
+} from "./domain.ts";
 
-interface ToolResult {
-  content?: { type: string; text?: string }[];
-  isError?: boolean;
-}
-
-/** The policy engine refused this tool call. Retrying will not help. */
-export class PolicyDenied extends Error {}
-
-export function textOrThrow(result: ToolResult): string {
-  const text = (result.content ?? [])
-    .filter((c) => c.type === "text")
-    .map((c) => c.text ?? "")
-    .join("\n");
-  if (result.isError) {
-    if (text.startsWith(DENIED)) throw new PolicyDenied(text);
-    throw new Error(text);
-  }
-  return text;
-}
-
-export async function callTool(
-  name: string,
-  args: Record<string, unknown>,
-  token: string,
-): Promise<string> {
-  const response = await fetch(GATEWAY_URL, {
+async function callTool(
+  gateway: GatewayUrl,
+  token: AccessToken,
+  tool: ToolName,
+  args: Readonly<Record<string, unknown>>,
+): Promise<Decision> {
+  const response = await fetch(gateway, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "tools/call",
-      params: { name, arguments: args },
-    }),
+    body: JSON.stringify(toolsCall(1, tool, args)),
   });
-  const reply = (await response.json()) as { result: ToolResult };
-  return textOrThrow(reply.result);
+  return parseToolReply(await response.json()); // outside data -> Decision, right here
 }
 
-const token = process.env.ACCESS_TOKEN!; // Auth0 access token, audience https://agents.fintech.example
-try {
-  console.log(
-    await callTool("tickets___create_ticket", { title: "VPN down", description: "..." }, token),
-  );
-} catch (err) {
-  if (!(err instanceof PolicyDenied)) throw err;
-  console.error(`not allowed: ${err.message}`);
-  process.exitCode = 2;
+async function main(): Promise<number> {
+  let gateway: GatewayUrl, token: AccessToken, tool: ToolName;
+  try {
+    gateway = parseGatewayUrl(process.env.GATEWAY_URL ?? "");
+    token = parseAccessToken(process.env.ACCESS_TOKEN ?? "");
+    tool = parseToolName("tickets___create_ticket");
+  } catch (error) {
+    if (!(error instanceof ParseError)) throw error;
+    console.error(`error: ${error.message}`);
+    return 2;
+  }
+  const decision = await callTool(gateway, token, tool, { title: "VPN down", description: "..." });
+  const { text, code } = render(decision);
+  (code === 0 ? console.log : console.error)(text);
+  return code;
 }
+
+process.exitCode = await main();

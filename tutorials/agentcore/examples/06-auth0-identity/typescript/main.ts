@@ -1,9 +1,19 @@
-// The helpdesk agent behind an Auth0 JWT authorizer: it knows who is calling.
+// The helpdesk agent behind an Auth0 JWT authorizer: it knows who is calling (the shell).
 import { Agent, tool } from "@strands-agents/sdk";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 import { z } from "zod";
-import { callerOf, type Caller } from "./identity.js";
-import { openTicket } from "./tickets.js";
+import { firstMessage, owns } from "./core.ts";
+import {
+  type Caller,
+  type SessionId,
+  type Subject,
+  claimsOf,
+  parseCaller,
+  parseInvocation,
+  parseSessionId,
+  parseTicketRequest,
+} from "./domain.ts";
+import { openTicket } from "./tickets.ts";
 
 const MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0";
 const SYSTEM_PROMPT = `You are the internal IT and expenses helpdesk for Fintech Ltd.
@@ -18,35 +28,28 @@ function newAgent(caller: Caller): Agent {
       title: z.string().describe("One-line summary of the problem."),
       description: z.string().describe("What the user needs, in their own words."),
     }),
-    // The requester comes from the verified token, never from the model.
     callback: ({ title, description }) =>
-      openTicket(title, description, caller.userId ?? caller.subject),
+      openTicket(parseTicketRequest(title, description), caller),
   });
   return new Agent({ model: MODEL_ID, systemPrompt: SYSTEM_PROMPT, tools: [createTicket] });
 }
 
-const agents = new Map<string, { owner: string; agent: Agent }>(); // session id -> owner, agent
+const agents = new Map<SessionId, { owner: Subject; agent: Agent }>();
 
 const app = new BedrockAgentCoreApp({
   invocationHandler: {
-    requestSchema: z.object({ prompt: z.string() }),
     async *process(payload, context) {
-      const caller = callerOf(context.headers["authorization"] ?? ""); // on the allowlist
-      const sessionId = context.sessionId || "local";
-      let prompt = payload.prompt;
-      if (!agents.has(sessionId)) {
-        agents.set(sessionId, { owner: caller.subject, agent: newAgent(caller) });
-        if (caller.firstName) {
-          // per-user details go in the first message, not the system prompt
-          prompt = `[Context: you are assisting ${caller.firstName}.]\n\n${prompt}`;
-        }
+      const caller = parseCaller(claimsOf(context.headers["authorization"])); // on the allowlist
+      const session = parseSessionId(context.sessionId);
+      const prompt = parseInvocation(payload);
+      let text: string = prompt;
+      if (!agents.has(session)) {
+        agents.set(session, { owner: caller.subject, agent: newAgent(caller) });
+        text = firstMessage(caller, prompt);
       }
-      const { owner, agent } = agents.get(sessionId)!;
-      if (owner !== caller.subject) {
-        // Runtime doesn't tie sessions to users; the agent does
-        throw new Error("this session belongs to another user");
-      }
-      for await (const event of agent.stream(prompt)) {
+      const { owner, agent } = agents.get(session)!;
+      if (!owns(owner, caller)) throw new Error("this session belongs to another caller");
+      for await (const event of agent.stream(text)) {
         if (
           event.type === "modelStreamUpdateEvent" &&
           event.event.type === "modelContentBlockDeltaEvent" &&

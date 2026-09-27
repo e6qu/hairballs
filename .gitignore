@@ -16,3 +16,4 @@ holdout-*.log
 .terraform/
 .terraform.lock.hcl
 *.tfstate*
+dist/

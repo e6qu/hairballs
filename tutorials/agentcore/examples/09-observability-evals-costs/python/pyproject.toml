@@ -13,3 +13,6 @@ dev = [
     "boto3-stubs[bedrock-agentcore,bedrock-agentcore-control]==1.43.103",
     "mypy==2.3.1",
 ]
+
+[tool.ruff]
+line-length = 100

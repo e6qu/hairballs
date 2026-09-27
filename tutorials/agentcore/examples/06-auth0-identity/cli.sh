@@ -54,7 +54,7 @@ rm -rf build agent.zip && mkdir build
 if [ "$LANGUAGE" = python ]; then
   uv pip install --target build --python-platform aarch64-manylinux2014 --python-version 3.13 \
     --only-binary=:all: -r python/pyproject.toml
-  cp python/main.py python/identity.py python/tickets.py build/
+  cp python/main.py python/domain.py python/core.py python/tickets.py build/
   RUNTIME=PYTHON_3_13
   ENTRY_POINT='["main.py"]'
 else

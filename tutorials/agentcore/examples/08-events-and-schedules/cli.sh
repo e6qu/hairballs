@@ -34,7 +34,7 @@ aws iam put-role-policy --role-name helpdesk-trigger --policy-name read-auth0-se
   --policy-document "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"secretsmanager:GetSecretValue\",\"Resource\":\"$SECRET_ARN\"}]}"
 sleep 10 # IAM is eventually consistent
 
-(cd python && zip -q ../handler.zip handler.py)
+(cd python && zip -q ../handler.zip handler.py domain.py core.py)
 aws lambda create-function --region "$REGION" --function-name "$FUNCTION" \
   --runtime python3.12 --handler handler.handler --timeout 60 \
   --role "arn:aws:iam::$ACCOUNT:role/helpdesk-trigger" \

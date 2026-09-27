@@ -246,47 +246,107 @@ What each caller sees:
 
 - **The model, inside a Strands agent.** The MCP client turns the result into an error tool result, and the model reads the text. Add one line to the system prompt: *"If a tool call is denied by policy, tell the user and do not retry it."*
 - **`tools/list`.** A caller never sees a tool that no policy would ever let it call. An M2M agent usually doesn't see `create_ticket` at all.
-- **Your own code** that calls tools directly. Tell a denial apart from other errors, and don't retry it:
+- **Your own code** that calls tools directly. It must tell a denial apart from other errors, and never retry a denial.
+
+The code has three parts, as in [01](01-first-agent.md):
+
+- **`domain`**: `GatewayUrl`, `AccessToken`, `ToolName` (`<target>___<tool>`), and the outcome of a call as a union: `Decision = Allowed | Denied | ToolFailed`. The Gateway's JSON-RPC reply is parsed straight into a `Decision` at the boundary.
+- **`core`**: pure functions: the request body (`tools_call`), `may_retry` (never for `Denied`) and `render` (text and exit code).
+- **shell** (`call_tool`): reads the environment, posts the request, prints.
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
+The shell (`call_tool.py`):
+
 ```python
-DENIED = "AuthorizeActionException"  # the Gateway's text for a Cedar deny
-
-
-class PolicyDenied(Exception):
-    """The policy engine refused this tool call. Retrying will not help."""
-
-
-def text_or_raise(result: ToolResult) -> str:
-    text = "\n".join(
-        c["text"] for c in result.get("content", []) if c["type"] == "text"
+def call_tool(
+    gateway: GatewayUrl, token: AccessToken, tool: ToolName, arguments: dict[str, object]
+) -> Decision:
+    request = urllib.request.Request(
+        gateway.value,
+        data=json.dumps(tools_call(1, tool, arguments)).encode(),
+        headers={
+            "Authorization": f"Bearer {token.value}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
     )
-    if result.get("isError"):
-        if text.startswith(DENIED):
-            raise PolicyDenied(text)
-        raise RuntimeError(text)
-    return text
+    with urllib.request.urlopen(request) as response:
+        return parse_tool_reply(json.load(response))  # outside data -> Decision, right here
 ```
 
 </td><td>
 
+The shell (`call_tool.ts`):
+
 ```typescript
-const DENIED = "AuthorizeActionException"; // the Gateway's text for a Cedar deny
+async function callTool(
+  gateway: GatewayUrl,
+  token: AccessToken,
+  tool: ToolName,
+  args: Readonly<Record<string, unknown>>,
+): Promise<Decision> {
+  const response = await fetch(gateway, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
+    body: JSON.stringify(toolsCall(1, tool, args)),
+  });
+  return parseToolReply(await response.json()); // outside data -> Decision, right here
+}
+```
 
-/** The policy engine refused this tool call. Retrying will not help. */
-export class PolicyDenied extends Error {}
+</td></tr><tr><td>
 
-export function textOrThrow(result: ToolResult): string {
-  const text = (result.content ?? [])
-    .filter((c) => c.type === "text")
-    .map((c) => c.text ?? "")
-    .join("\n");
-  if (result.isError) {
-    if (text.startsWith(DENIED)) throw new PolicyDenied(text);
-    throw new Error(text);
+The boundary parser (`domain.py`):
+
+```python
+def parse_tool_reply(raw: object) -> Decision:
+    """A JSON-RPC reply to tools/call -> Decision."""
+    reply = _fields(raw, "$")
+    if "error" in reply:
+        message = _fields(reply["error"], "$.error").get("message")
+        return ToolFailed(message if isinstance(message, str) else "JSON-RPC error")
+    result = _fields(reply.get("result"), "$.result")
+    content = result.get("content", [])
+    if not isinstance(content, list):
+        raise ParseError("$.result.content: expected a list")
+    texts = [block.get("text") for block in content if isinstance(block, Mapping)]
+    text = "\n".join(t for t in texts if isinstance(t, str))
+    if result.get("isError") is not True:
+        return Allowed(text)
+    if text.startswith(DENIED_PREFIX):
+        return Denied(text)
+    return ToolFailed(text)
+```
+
+</td><td>
+
+The boundary parser (`domain.ts`):
+
+```typescript
+// A JSON-RPC reply to tools/call -> Decision.
+export function parseToolReply(raw: unknown): Decision {
+  const reply = fields(raw, "$");
+  if (reply.error !== undefined) {
+    const message = fields(reply.error, "$.error").message;
+    return { kind: "failed", message: typeof message === "string" ? message : "JSON-RPC error" };
   }
-  return text;
+  const result = fields(reply.result, "$.result");
+  const content: unknown = result.content ?? [];
+  if (!Array.isArray(content)) throw new ParseError("$.result.content: expected a list");
+  const text = content
+    .map((block: unknown) => (typeof block === "object" && block !== null ? block : {}))
+    .map((block) => ("text" in block && typeof block.text === "string" ? block.text : ""))
+    .filter((t) => t !== "")
+    .join("\n");
+  if (result.isError !== true) return { kind: "allowed", text };
+  if (text.startsWith(DENIED_PREFIX)) return { kind: "denied", reason: text };
+  return { kind: "failed", message: text };
 }
 ```
 
@@ -294,7 +354,7 @@ export function textOrThrow(result: ToolResult): string {
 
 Terraform: [`aws_bedrockagentcore_gateway.tools`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway) (callers authenticate with Auth0 tokens, not IAM)
 
-Try it with an M2M token from [06](06-auth0-identity.md): `ACCESS_TOKEN=<m2m token> uv run python call_tool.py` prints `not allowed: AuthorizeActionException …` and exits with code 2. With a user's token, it prints the new ticket id.
+Try it with an M2M token from [06](06-auth0-identity.md): `ACCESS_TOKEN=<m2m token> uv run python call_tool.py` (or `npm run call-tool`) prints `not allowed: AuthorizeActionException …` and exits with code 2. With a user's token, it prints the new ticket id.
 
 ## What just happened
 

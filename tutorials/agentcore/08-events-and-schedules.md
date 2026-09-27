@@ -27,52 +27,65 @@ A Lambda runs for at most 15 minutes. An agent run can take longer. So the agent
 
 While a background task is registered, the agent's `/ping` answers `HealthyBusy`. AgentCore then keeps the session alive past the 15-minute idle timeout, for up to 8 hours.
 
+The code has the same three parts as in [01](01-first-agent.md), shared by the agent and the Lambda of Step 3:
+
+- **`domain`**: `Task` (task id and prompt), `TaskState` (`running | done | failed`), the `Trigger` union (`DailyDigest | TicketEscalated`), `SessionId`, `CachedToken`. The agent's payload, the Lambda event, Auth0's reply and the agent's reply are each parsed into these at the boundary.
+- **`core`**: pure decisions: `on_task` (start a new task, or report a known one), `task_for`, `session_id_for`, `usable` (is the cached token still good at time `now`).
+- **shell**: the agent entrypoint and background task here; the Lambda handler in Step 3.
+
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
+The shell (`agent.py`):
+
 ```python
-async def run(task_id: str, prompt: str) -> None:
+async def run(task: Task) -> None:
     # While the task is registered, /ping answers HealthyBusy and the session stays alive.
-    ping_id = app.add_async_task("helpdesk-task", {"taskId": task_id})
+    ping_id = app.add_async_task("helpdesk-task", {"taskId": task.task_id})
     try:
         agent = Agent(model=MODEL_ID, system_prompt=SYSTEM_PROMPT)
-        result = await agent.invoke_async(prompt)
+        result = await agent.invoke_async(task.prompt)
         # Report the result: a queue, a ticket note, a chat message.
-        print(f"task {task_id} done: {result}")
-        tasks[task_id] = "done"
+        print(f"task {task.task_id} done: {result}")
+        tasks[task.task_id] = TaskState.DONE
     except Exception as error:
-        print(f"task {task_id} failed: {error!r}")
-        tasks[task_id] = "failed"
+        print(f"task {task.task_id} failed: {error!r}")
+        tasks[task.task_id] = TaskState.FAILED
     finally:
         # /ping answers Healthy again; the idle timeout starts counting.
         app.complete_async_task(ping_id)
 
 
 @app.entrypoint
-async def invoke(payload: dict[str, str], context: RequestContext) -> dict[str, str]:
-    task_id = payload["taskId"]
-    if task_id not in tasks:  # a retried event must not start a second run
-        tasks[task_id] = "running"
-        job = asyncio.create_task(run(task_id, payload["prompt"]))
-        background.add(job)
-        job.add_done_callback(background.discard)
-    return {"status": "accepted", "taskId": task_id, "state": tasks[task_id]}
+async def invoke(payload: object, context: RequestContext) -> dict[str, str]:
+    task = parse_task(payload)  # outside data -> domain type, right here
+    match on_task(tasks, task):
+        case Start():
+            tasks[task.task_id] = TaskState.RUNNING
+            job = asyncio.create_task(run(task))
+            background.add(job)
+            job.add_done_callback(background.discard)
+        case AlreadyKnown():
+            pass  # a retried event must not start a second run
+    return accepted(task, tasks[task.task_id])
 ```
 
 </td><td>
 
+The shell (`agent.ts`):
+
 ```typescript
-async function run(taskId: string, prompt: string): Promise<void> {
+async function run(task: Task): Promise<void> {
   // While the task is registered, /ping answers HealthyBusy and the session stays alive.
-  const pingId = app.addAsyncTask("helpdesk-task", { taskId });
+  const pingId = app.addAsyncTask("helpdesk-task", { taskId: task.taskId });
   try {
     const agent = new Agent({ model: MODEL_ID, systemPrompt: SYSTEM_PROMPT });
-    const result = await agent.invoke(prompt);
+    const result = await agent.invoke(task.prompt);
     // Report the result: a queue, a ticket note, a chat message.
-    console.log(`task ${taskId} done: ${result.toString()}`);
-    tasks.set(taskId, "done");
+    console.log(`task ${task.taskId} done: ${result.toString()}`);
+    tasks.set(task.taskId, "done");
   } catch (error) {
-    console.error(`task ${taskId} failed`, error);
-    tasks.set(taskId, "failed");
+    console.error(`task ${task.taskId} failed`, error);
+    tasks.set(task.taskId, "failed");
   } finally {
     // /ping answers Healthy again; the idle timeout starts counting.
     app.completeAsyncTask(pingId);
@@ -81,17 +94,50 @@ async function run(taskId: string, prompt: string): Promise<void> {
 
 const app = new BedrockAgentCoreApp({
   invocationHandler: {
-    requestSchema: z.object({ taskId: z.string(), prompt: z.string() }),
-    process: async ({ taskId, prompt }) => {
-      // A retried event must not start a second run.
-      if (!tasks.has(taskId)) {
-        tasks.set(taskId, "running");
-        void run(taskId, prompt);
-      }
-      return { status: "accepted", taskId, state: tasks.get(taskId) };
+    process: async (payload: unknown) => {
+      const task = parseTask(payload); // outside data -> domain type, right here
+      const next = onTask(tasks, task);
+      if (next.kind === "start") {
+        tasks.set(task.taskId, "running");
+        void run(task);
+      } // a retried event must not start a second run
+      return accepted(task, tasks.get(task.taskId) ?? "running");
     },
   },
 });
+```
+
+</td></tr><tr><td>
+
+The parser (`domain.py`) and the decision (`core.py`):
+
+```python
+def parse_task(raw: object) -> Task:
+    """The agent's /invocations payload -> Task."""
+    payload = _fields(raw, "$")
+    return Task(_text(payload, "taskId", "$"), _text(payload, "prompt", "$"))
+
+
+def on_task(known: Mapping[str, TaskState], task: Task) -> Start | AlreadyKnown:
+    state = known.get(task.task_id)
+    return Start() if state is None else AlreadyKnown(state)
+```
+
+</td><td>
+
+The parser (`domain.ts`) and the decision (`core.ts`):
+
+```typescript
+// The agent's /invocations payload -> Task.
+export function parseTask(raw: unknown): Task {
+  const payload = fields(raw, "$");
+  return { taskId: text(payload, "taskId", "$"), prompt: text(payload, "prompt", "$") };
+}
+
+export function onTask(known: ReadonlyMap<string, TaskState>, task: Task): OnTask {
+  const state = known.get(task.taskId);
+  return state === undefined ? { kind: "start" } : { kind: "known", state };
+}
 ```
 
 </td></tr></table>
@@ -174,101 +220,148 @@ The call itself is plain HTTPS. The agent accepts Auth0 bearer tokens (JWT inbou
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
+The shell (`handler.py`):
+
 ```python
-def m2m_token() -> str:
-    """Client-credentials token, cached for as long as this Lambda instance lives."""
-    global _token, _token_expires
-    if time.time() < _token_expires - 60:
-        return _token
+def m2m_token(config: Config) -> CachedToken:
+    """Client-credentials token, fetched once per instance and reused until it nearly expires."""
+    global _cached
+    token = usable(_cached, time.time())
+    if token is not None:
+        return token
     secrets = boto3.client("secretsmanager")
-    client_secret = secrets.get_secret_value(SecretId=AUTH0_SECRET_ID)["SecretString"]
+    secret = secrets.get_secret_value(SecretId=config.secret_id)["SecretString"]
     form = {
         "grant_type": "client_credentials",
-        "client_id": AUTH0_CLIENT_ID,
-        "client_secret": client_secret,
+        "client_id": config.client_id,
+        "client_secret": secret,
         "audience": AUDIENCE,
     }
     body = urllib.parse.urlencode(form).encode()
     with urllib.request.urlopen(AUTH0_TOKEN_URL, body, timeout=10) as response:
-        reply = cast(TokenReply, json.load(response))
-    _token, _token_expires = reply["access_token"], time.time() + reply["expires_in"]
-    return _token
+        _cached = parse_token_response(json.load(response), now=time.time())
+    return _cached
 
 
-def session_id(event: Event) -> str:
-    """Same event -> same session id. A retried delivery reaches the same agent session."""
-    return hashlib.sha256(f"{event['source']}:{event['id']}".encode()).hexdigest()
-
-
-def handler(event: Event, context: object) -> dict[str, str]:
-    arn = urllib.parse.quote(AGENT_ARN, safe="")
-    url = f"https://bedrock-agentcore.{REGION}.amazonaws.com/runtimes/{arn}/invocations?qualifier=DEFAULT"
-    request = urllib.request.Request(
-        url,
-        data=json.dumps({"taskId": event["id"], "prompt": prompt_for(event)}).encode(),
-        headers={
-            "Authorization": f"Bearer {m2m_token()}",
-            "Content-Type": "application/json",
-            "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": session_id(event),
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        reply: dict[str, str] = json.load(response)
-    print(json.dumps({"event": event["id"], "agent": reply}))
-    return reply  # {"status": "accepted", ...}: the agent keeps working on its own
+def handler(event: object, context: object) -> dict[str, str]:
+    config = parse_config(os.environ)
+    trigger = parse_trigger(event)  # outside data -> domain type, right here
+    reply = start(config, m2m_token(config), session_id_for(trigger.ref), task_for(trigger))
+    print(json.dumps({"taskId": reply.task_id, "state": reply.state.value}))
+    return {"taskId": reply.task_id, "state": reply.state.value}  # the agent keeps working
 ```
 
 </td><td>
 
+The shell (`handler.ts`):
+
 ```typescript
-/** Client-credentials token, cached for as long as this Lambda instance lives. */
-async function m2mToken(): Promise<string> {
-  if (Date.now() < tokenExpires - 60_000) return token;
-  const secret = await secrets.send(new GetSecretValueCommand({ SecretId: AUTH0_SECRET_ID }));
+// Client-credentials token, fetched once per instance and reused until it nearly expires.
+async function m2mToken(config: Config): Promise<CachedToken> {
+  const token = usable(cached, Date.now());
+  if (token !== undefined) return token;
+  const secret = await secrets.send(new GetSecretValueCommand({ SecretId: config.secretId }));
   const response = await fetch(AUTH0_TOKEN_URL, {
     method: "POST",
     body: new URLSearchParams({
       grant_type: "client_credentials",
-      client_id: AUTH0_CLIENT_ID,
-      client_secret: secret.SecretString!,
+      client_id: config.clientId,
+      client_secret: secret.SecretString ?? "",
       audience: AUDIENCE,
     }),
   });
-  const reply = (await response.json()) as { access_token: string; expires_in: number };
-  token = reply.access_token;
-  tokenExpires = Date.now() + reply.expires_in * 1000;
-  return token;
+  cached = parseTokenResponse(await response.json(), Date.now());
+  return cached;
 }
 
-/** Same event -> same session id. A retried delivery reaches the same agent session. */
-export function sessionId(event: Event): string {
-  return createHash("sha256").update(`${event.source}:${event.id}`).digest("hex");
+export async function handler(event: unknown): Promise<Accepted> {
+  const config = parseConfig(process.env);
+  const trigger = parseTrigger(event); // outside data -> domain type, right here
+  const reply = await start(
+    config,
+    await m2mToken(config),
+    sessionIdFor(trigger.ref),
+    taskFor(trigger),
+  );
+  console.log(JSON.stringify(reply));
+  return reply; // the agent keeps working on its own
+}
+```
+
+</td></tr><tr><td>
+
+The boundary parser (`domain.py`):
+
+```python
+def parse_trigger(raw: object) -> Trigger:
+    """An EventBridge event (rule or Scheduler input) -> Trigger."""
+    event = _fields(raw, "$")
+    ref = EventRef(_text(event, "source", "$"), _text(event, "id", "$"))
+    if ref.source == "scheduler.daily-digest":
+        return DailyDigest(ref)
+    if ref.source == "fintech.tickets" and event.get("detail-type") == "TicketEscalated":
+        ticket_id = _text(_fields(event.get("detail"), "$.detail"), "ticketId", "$.detail")
+        if not _TICKET_ID.fullmatch(ticket_id):
+            raise ParseError(f"$.detail.ticketId: not a ticket id: {ticket_id!r}")
+        return TicketEscalated(ref, ticket_id)
+    raise ParseError(f"$: no run for events from {ref.source!r}")
+```
+
+</td><td>
+
+The boundary parser (`domain.ts`):
+
+```typescript
+// An EventBridge event (rule or Scheduler input) -> Trigger.
+export function parseTrigger(raw: unknown): Trigger {
+  const event = fields(raw, "$");
+  const ref = { source: text(event, "source", "$"), id: text(event, "id", "$") };
+  if (ref.source === "scheduler.daily-digest") return { kind: "dailyDigest", ref };
+  if (ref.source === "fintech.tickets" && event["detail-type"] === "TicketEscalated") {
+    const ticketId = text(fields(event.detail, "$.detail"), "ticketId", "$.detail");
+    if (!TICKET_ID.test(ticketId)) throw new ParseError(`$.detail.ticketId: ${ticketId}`);
+    return { kind: "ticketEscalated", ref, ticketId };
+  }
+  throw new ParseError(`$: no run for events from ${ref.source}`);
+}
+```
+
+</td></tr><tr><td>
+
+The rules (`core.py`): no clock, `now` is passed in:
+
+```python
+def session_id_for(ref: EventRef) -> SessionId:
+    """Same event -> same session id, so a retried delivery reaches the same agent session."""
+    return SessionId.parse(hashlib.sha256(f"{ref.source}:{ref.id}".encode()).hexdigest())
+
+
+def usable(token: CachedToken | None, now: float) -> CachedToken | None:
+    """The cached token if it is valid for at least another minute, else None."""
+    if token is not None and now < token.expires_at - TOKEN_MARGIN_SECONDS:
+        return token
+    return None
+```
+
+</td><td>
+
+The rules (`core.ts`): no clock, `now` is passed in:
+
+```typescript
+// Same event -> same session id, so a retried delivery reaches the same agent session.
+export function sessionIdFor(ref: EventRef): SessionId {
+  return parseSessionId(createHash("sha256").update(`${ref.source}:${ref.id}`).digest("hex"));
 }
 
-export async function handler(event: Event): Promise<Record<string, string>> {
-  const arn = encodeURIComponent(AGENT_ARN);
-  const url = `https://bedrock-agentcore.${REGION}.amazonaws.com/runtimes/${arn}/invocations?qualifier=DEFAULT`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${await m2mToken()}`,
-      "Content-Type": "application/json",
-      "X-Amzn-Bedrock-AgentCore-Runtime-Session-Id": sessionId(event),
-    },
-    body: JSON.stringify({ taskId: event.id, prompt: promptFor(event) }),
-    signal: AbortSignal.timeout(30_000),
-  });
-  if (!response.ok) throw new Error(`agent returned ${response.status}: ${await response.text()}`);
-  const reply = (await response.json()) as Record<string, string>;
-  console.log(JSON.stringify({ event: event.id, agent: reply }));
-  return reply; // {"status": "accepted", ...}: the agent keeps working on its own
+// The cached token if it is valid for at least another minute, else undefined.
+export function usable(token: CachedToken | undefined, now: number): CachedToken | undefined {
+  return token !== undefined && now < token.expiresAt - TOKEN_MARGIN_MS ? token : undefined;
 }
 ```
 
 </td></tr></table>
 
-The Python handler needs nothing outside the Lambda runtime: zip `handler.py` alone. Bundle the TypeScript handler into one `handler.js` (for example with esbuild) and zip that.
+The Python handler needs nothing outside the Lambda runtime: zip `handler.py`, `domain.py` and `core.py`. Bundle the TypeScript handler into one `handler.js` (for example with esbuild) and zip that.
 
 Terraform: [`aws_secretsmanager_secret.auth0`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/secretsmanager_secret), [`aws_iam_role_policy.trigger_secret`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy) (the handler's permission to read the secret)
 

@@ -5,9 +5,13 @@
     "moduleResolution": "NodeNext",
     "strict": true,
     "skipLibCheck": true,
+    "types": ["node"],
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
+    "noUncheckedIndexedAccess": true,
+    "verbatimModuleSyntax": true,
     "outDir": "dist",
-    "rootDir": ".",
-    "types": ["node"]
+    "rootDir": "."
   },
   "include": ["*.ts"]
 }

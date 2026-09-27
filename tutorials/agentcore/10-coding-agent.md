@@ -150,9 +150,17 @@ Terraform: [`aws_iam_role_policy.coder_tools`](https://registry.terraform.io/pro
 
 ## Step 4: Give the token to git, not to the model
 
-The agent's `clone` and `push` tools call `git()`. It fetches the user's token from the vault on each use and passes it to the `git` process in environment variables only: not in the command line, not in a file, not in the model's context. Runtime logs every `InvokeAgentRuntimeCommand` command line, so a token must never be part of one.
+The agent's `clone` and `push` tools fetch the user's token from the vault on each use and pass it to the `git` process in environment variables only: not in the command line, not in a file, not in the model's context. Runtime logs every `InvokeAgentRuntimeCommand` command line, so a token must never be part of one.
+
+The code has the same three parts as in [01](01-first-agent.md):
+
+- **`domain`**: `Repo` (`owner/name`), `RepoPath` (made only from a `Repo`, so it is always inside `/mnt/workspace`), `BranchName`, `CommitMessage`, `AllowedCommand` (an argv list whose program is on the allowlist), `GitHubToken`, and `Outcome = Finished | TimedOut`. Every tool argument the model sends is parsed into these first; a bad one comes back to the model as `refused: …`.
+- **`core`**: pure functions: `git_env` (the token as git configuration), `clone_argv`, `commit_steps`, `describe` (what the model sees of a command).
+- **shell**: the Strands tools, the vault call and the child processes.
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
+
+The shell (`agent.py`):
 
 ```python
 @requires_access_token(
@@ -162,49 +170,129 @@ The agent's `clone` and `push` tools call `git()`. It fetches the user's token f
     on_auth_url=ask_user_to_consent,
     into="token",
 )
-async def github_token(*, token: str = "") -> str:
-    """The user's GitHub token from the token vault. Never stored, never logged."""
+async def vault_token(*, token: str = "") -> str:
     return token
 
 
-async def git(args: list[str], cwd: Path) -> str:
-    """Run git with the token in the child's environment only: not in argv, files or logs."""
-    basic = base64.b64encode(f"x-access-token:{await github_token()}".encode()).decode()
-    env = {
-        **os.environ,
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_CONFIG_COUNT": "1",
-        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
-    }
-    done = subprocess.run(
-        ["git", *args], cwd=cwd, env=env, capture_output=True, text=True, timeout=600
-    )
-    return f"exit {done.returncode}\n{(done.stdout + done.stderr)[-4000:]}"
+async def github_token() -> GitHubToken:
+    """The user's GitHub token from the token vault, parsed at the boundary."""
+    return GitHubToken.parse(await vault_token())
+
+
+async def git_with_token(argv: list[str], cwd: str) -> str:
+    env = {**os.environ, **git_env((await github_token()).value)}
+    return describe(execute(argv, cwd, env))
+
+
+@tool
+def run(repo: str, argv: list[str]) -> str:
+    """Run one allowed program in a cloned repository, for example ["npm", "test"]. No shell.
+
+    Args:
+        repo: owner/name of a cloned repository.
+        argv: the program and its arguments.
+    """
+    try:
+        path = RepoPath.of(Repo.parse(repo))
+        command = AllowedCommand.parse(argv)
+    except ParseError as exc:
+        return f"refused: {exc}"
+    return describe(execute(command.argv, str(path.path)))
 ```
 
 </td><td>
 
+The shell (`agent.ts`):
+
 ```typescript
-/** The user's GitHub token from the token vault. Never stored, never logged. */
-const githubToken = withAccessToken({
+// The user's GitHub token from the token vault, parsed at the boundary.
+const githubToken: () => Promise<GitHubToken> = withAccessToken({
   providerName: "github",
   scopes: ["repo"],
   authFlow: "USER_FEDERATION",
   // First use only: the user must allow GitHub access once. Send them this link.
   onAuthUrl: (url) => console.log(`GitHub consent needed: ${url}`),
-})(async (token: string) => token);
+})(async (token: string) => parseGitHubToken(token));
 
-/** Run git with the token in the child's environment only: not in argv, files or logs. */
-async function git(args: string[], cwd: string): Promise<string> {
-  const basic = Buffer.from(`x-access-token:${await githubToken()}`).toString("base64");
-  return runProgram(["git", ...args], cwd, {
-    ...process.env,
+async function gitWithToken(argv: readonly string[], cwd: string): Promise<string> {
+  return describe(await execute(argv, cwd, { ...process.env, ...gitEnv(await githubToken()) }));
+}
+
+const run = tool({
+  name: "run",
+  description: 'Run one allowed program in a cloned repository, e.g. ["npm", "test"]. No shell.',
+  inputSchema: z.object({ repo: z.string(), argv: z.array(z.string()) }),
+  callback: ({ repo, argv }) =>
+    refusing(async () => {
+      const path = repoPath(parseRepo(repo));
+      const command = parseAllowedCommand(argv);
+      return describe(await execute([command.program, ...command.args], path));
+    }),
+});
+```
+
+</td></tr><tr><td>
+
+The allowlist parser (`domain.py`) and the git environment (`core.py`):
+
+```python
+@dataclass(frozen=True, slots=True)
+class AllowedCommand:
+    """An argv list whose program is allowed. Never a shell string."""
+
+    program: Program
+    args: tuple[str, ...]
+
+    @classmethod
+    def parse(cls, raw: object) -> AllowedCommand:
+        if not isinstance(raw, list) or not raw or not all(isinstance(a, str) for a in raw):
+            raise ParseError("argv must be a non-empty list of strings")
+        try:
+            program = Program(raw[0])
+        except ValueError as exc:
+            allowed = ", ".join(p.value for p in Program)
+            raise ParseError(f"{raw[0]!r} is not allowed; use one of {allowed}") from exc
+        return cls(program, tuple(raw[1:]))
+
+    @property
+    def argv(self) -> list[str]:
+        return [self.program.value, *self.args]
+
+
+def git_env(token_value: str) -> dict[str, str]:
+    """Environment for one git process: the token goes here, never into argv, files or logs."""
+    basic = base64.b64encode(f"x-access-token:{token_value}".encode()).decode()
+    return {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+        "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+    }
+```
+
+</td><td>
+
+The allowlist parser (`domain.ts`) and the git environment (`core.ts`):
+
+```typescript
+export function parseAllowedCommand(raw: readonly string[]): AllowedCommand {
+  const [first, ...args] = raw;
+  const program = PROGRAMS.find((p) => p === first);
+  if (program === undefined) {
+    throw new ParseError(`${String(first)} is not allowed; use one of ${PROGRAMS.join(", ")}`);
+  }
+  return { program, args };
+}
+
+// Environment for one git process: the token goes here, never into argv, files or logs.
+export function gitEnv(tokenValue: string): Readonly<Record<string, string>> {
+  const basic = Buffer.from(`x-access-token:${tokenValue}`).toString("base64");
+  return {
     GIT_TERMINAL_PROMPT: "0",
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
     GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
-  });
+  };
 }
 ```
 
@@ -212,7 +300,7 @@ async function git(args: string[], cwd: string): Promise<string> {
 
 - **Which user.** `USER_FEDERATION` needs to know the user. Your workflow passes it as `runtimeUserId` in Step 5, and AgentCore gives the agent a workload token for that user.
 - **The first time,** there is no token yet: `on_auth_url` / `onAuthUrl` receives GitHub's consent link. Send it to the developer (here it is only logged). **[verify]** how long the call waits for consent, and how your app completes the session binding (`CompleteResourceTokenAuth`, see [06](06-auth0-identity.md)).
-- **The other tools.** `run` executes one program from an allowlist as an argv list, never a shell string, inside the repository. The editor tool changes files. Paths outside `/mnt/workspace` are refused.
+- **The other tools.** `run` executes one allowed program as an argv list, never a shell string, inside the repository; `push` commits locally, then pushes with the token. The editor tool changes files.
 
 Terraform: [`aws_bedrockagentcore_oauth2_credential_provider.github`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_oauth2_credential_provider), [`aws_iam_role_policy.coder_tools`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy)
 
@@ -221,81 +309,183 @@ Terraform: [`aws_bedrockagentcore_oauth2_credential_provider.github`](https://re
 Your workflow is a trusted backend, such as the Lambda from [08](08-events-and-schedules.md). It uses one session id per task, so every step lands in the same VM and workspace.
 
 - `ask` prompts the agent (`InvokeAgentRuntime`) and names the user with `runtimeUserId`. That needs the IAM action `bedrock-agentcore:InvokeAgentRuntimeForUser`. AgentCore does not check the value, so only the workflow may send it, and it takes it from the user's verified Auth0 token.
-- `sh` runs a command in the same VM (`InvokeAgentRuntimeCommand`): no model, no tokens. The test run decides whether the change is done, not the model.
+- `sh` runs a command in the same VM (`InvokeAgentRuntimeCommand`): no model, no tokens. Each streamed event is parsed into `Output` or an `Outcome`.
+- `after_tests` in `core` decides what happens next, as a value: `Done | AskToFix | GiveUp`. The test run decides, not the model. The session id's random part is passed into `task_session`; the core has no randomness.
 
 <table><tr><th>Python</th><th>TypeScript</th></tr><tr><td>
 
+The shell (`workflow.py`):
+
 ```python
-def sh(command: str, session_id: str, timeout: int = 900) -> int:
-    """Run a command in the agent's VM: no model, no tokens. Returns the exit code."""
+def sh(agent: AgentArn, session: SessionId, command: str, timeout: int = 900) -> Outcome:
+    """Run a command in the agent's VM: no model, no tokens."""
     response = client.invoke_agent_runtime_command(
-        agentRuntimeArn=AGENT_ARN,
-        runtimeSessionId=session_id,
+        agentRuntimeArn=agent.value,
+        runtimeSessionId=session.value,
         body={"command": f'/bin/bash -c "{command}"', "timeout": timeout},
     )
-    for event in response["stream"]:
-        chunk = event.get("chunk", {})
-        if "contentDelta" in chunk:
-            delta = chunk["contentDelta"]
-            print(delta.get("stdout", "") + delta.get("stderr", ""), end="")
-        if "contentStop" in chunk:
-            return chunk["contentStop"]["exitCode"]
-    return -1
+    for raw in response["stream"]:
+        event = parse_command_event(raw)  # outside data -> domain type, right here
+        if isinstance(event, Output):
+            print(event.text, end="")
+        elif event is not None:
+            return event
+    raise ParseError("the command stream ended without an exit code")
 
 
-def main() -> None:
-    session = f"coder-issue-42-{uuid.uuid4()}"  # one session (and workspace) per task
-    user = os.environ["USER_ID"]  # who asked; taken from their verified Auth0 token
-    print(ask("Fix issue 42 in fintech/helpdesk-api. Clone it first.", session, user))
+def main() -> int:
+    try:
+        agent = AgentArn.parse(os.environ.get("AGENT_ARN", ""))
+        user = UserId.parse(os.environ.get("USER_ID", ""))  # from their verified Auth0 token
+        token = UserToken.parse(os.environ.get("USER_TOKEN", ""))
+        repo, branch = Repo.parse("fintech/helpdesk-api"), BranchName.parse("fix/issue-42")
+    except ParseError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    session = task_session("issue-42", str(uuid.uuid4()))  # one session (and workspace) per task
+    print(ask(agent, session, user, f"Fix issue 42 in {repo.slug}. Clone it first."))
 
-    tests = "cd /mnt/workspace/helpdesk-api && npm ci && npm test"
-    for _ in range(3):  # the test run decides, not the model
-        if sh(tests, session) == 0:
-            break
-        print(ask("The tests fail. Run them, read the output, fix it.", session, user))
-    else:
-        raise SystemExit("tests still fail: a human takes over")
+    tests = f"cd /mnt/workspace/{repo.name} && npm ci && npm test"
+    attempt = 0
+    while True:
+        match after_tests(sh(agent, session, tests), attempt, MAX_ATTEMPTS):
+            case Done():
+                break
+            case AskToFix(attempt=attempt):
+                print(
+                    ask(agent, session, user, "The tests fail. Run them, read the output, fix it.")
+                )
+            case GiveUp():
+                print("tests still fail: a human takes over", file=sys.stderr)
+                return 1
 
-    print(ask("Push the change to a new branch fix/issue-42.", session, user))
+    print(ask(agent, session, user, f"Push the change to a new branch {branch.value}."))
+    pr = PullRequest(repo, branch, BranchName.parse("main"), "Fix issue 42")
+    print(open_pull_request(pr, token))
+    return 0
 ```
 
 </td><td>
 
+The shell (`workflow.ts`):
+
 ```typescript
-async function sh(command: string, sessionId: string, timeout = 900): Promise<number> {
+// Run a command in the agent's VM: no model, no tokens.
+async function sh(
+  agent: AgentArn,
+  session: SessionId,
+  command: string,
+  timeout = 900,
+): Promise<Outcome> {
   const response = await client.send(
     new InvokeAgentRuntimeCommandCommand({
-      agentRuntimeArn: AGENT_ARN,
-      runtimeSessionId: sessionId,
+      agentRuntimeArn: agent,
+      runtimeSessionId: session,
       body: { command: `/bin/bash -c "${command}"`, timeout },
     }),
   );
-  for await (const event of response.stream ?? []) {
-    const chunk = event.chunk;
-    if (chunk?.contentDelta) {
-      process.stdout.write((chunk.contentDelta.stdout ?? "") + (chunk.contentDelta.stderr ?? ""));
+  for await (const raw of response.stream ?? []) {
+    const event = parseCommandEvent(raw); // outside data -> domain type, right here
+    if (event?.kind === "output") process.stdout.write(event.text);
+    else if (event) return event;
+  }
+  throw new ParseError("the command stream ended without an exit code");
+}
+
+async function main(): Promise<number> {
+  const agent = parseAgentArn(process.env.AGENT_ARN ?? "");
+  const user = parseUserId(process.env.USER_ID ?? ""); // from their verified Auth0 token
+  const token = parseUserToken(process.env.USER_TOKEN ?? "");
+  const repo = parseRepo("fintech/helpdesk-api");
+  const branch = parseBranchName("fix/issue-42");
+  const session = taskSession("issue-42", randomUUID()); // one session (and workspace) per task
+  console.log(
+    await ask(agent, session, user, `Fix issue 42 in ${repo.owner}/${repo.name}. Clone it first.`),
+  );
+
+  const tests = `cd /mnt/workspace/${repo.name} && npm ci && npm test`;
+  for (let attempt = 0; ; ) {
+    const next = afterTests(await sh(agent, session, tests), attempt, MAX_ATTEMPTS);
+    if (next.kind === "done") break;
+    if (next.kind === "giveUp") {
+      console.error("tests still fail: a human takes over");
+      return 1;
     }
-    if (chunk?.contentStop) return chunk.contentStop.exitCode ?? -1;
+    attempt = next.attempt;
+    console.log(
+      await ask(agent, session, user, "The tests fail. Run them, read the output, fix it."),
+    );
   }
-  return -1;
+
+  console.log(await ask(agent, session, user, `Push the change to a new branch ${branch}.`));
+  const pr = { repo, head: branch, base: parseBranchName("main"), title: "Fix issue 42" };
+  console.log(await openPullRequest(pr, token));
+  return 0;
+}
+```
+
+</td></tr><tr><td>
+
+The stream parser (`domain.py`) and the decision (`core.py`):
+
+```python
+def parse_command_event(raw: Mapping[str, object]) -> CommandEvent | None:
+    """One InvokeAgentRuntimeCommand stream event, or None for events the workflow ignores."""
+    chunk = _fields(raw.get("chunk", {}), "$.chunk")
+    if "contentDelta" in chunk:
+        delta = _fields(chunk["contentDelta"], "$.chunk.contentDelta")
+        parts = [delta.get("stdout"), delta.get("stderr")]
+        return Output("".join(p for p in parts if isinstance(p, str)))
+    if "contentStop" in chunk:
+        stop = _fields(chunk["contentStop"], "$.chunk.contentStop")
+        code = stop.get("exitCode")
+        if stop.get("status") == "TIMED_OUT":
+            return TimedOut("")
+        if not isinstance(code, int):
+            raise ParseError("$.chunk.contentStop.exitCode: expected an integer")
+        return Finished(code, "")
+    return None
+
+
+def after_tests(outcome: Outcome, attempt: int, max_attempts: int) -> Done | AskToFix | GiveUp:
+    """The test run decides, not the model."""
+    if isinstance(outcome, Finished) and outcome.exit_code == 0:
+        return Done()
+    return AskToFix(attempt + 1) if attempt + 1 < max_attempts else GiveUp()
+```
+
+</td><td>
+
+The stream parser (`domain.ts`) and the decision (`core.ts`):
+
+```typescript
+// One InvokeAgentRuntimeCommand stream event, or undefined for events the workflow ignores.
+export function parseCommandEvent(
+  raw: InvokeAgentRuntimeCommandStreamOutput,
+): CommandEvent | undefined {
+  const chunk = raw.chunk;
+  if (chunk?.contentDelta) {
+    return {
+      kind: "output",
+      text: (chunk.contentDelta.stdout ?? "") + (chunk.contentDelta.stderr ?? ""),
+    };
+  }
+  if (chunk?.contentStop) {
+    if (chunk.contentStop.status === "TIMED_OUT") return { kind: "timedOut", output: "" };
+    const exitCode = chunk.contentStop.exitCode;
+    if (exitCode === undefined) throw new ParseError("$.chunk.contentStop.exitCode: missing");
+    return { kind: "finished", exitCode, output: "" };
+  }
+  return undefined;
 }
 
-const session = `coder-issue-42-${randomUUID()}`; // one session (and workspace) per task
-const user = process.env.USER_ID!; // who asked; taken from their verified Auth0 token
-console.log(await ask("Fix issue 42 in fintech/helpdesk-api. Clone it first.", session, user));
-
-const tests = "cd /mnt/workspace/helpdesk-api && npm ci && npm test";
-let passed = false;
-for (let i = 0; i < 3 && !passed; i++) {
-  // the test run decides, not the model
-  passed = (await sh(tests, session)) === 0;
-  if (!passed) {
-    console.log(await ask("The tests fail. Run them, read the output, fix it.", session, user));
-  }
+// The test run decides, not the model.
+export function afterTests(outcome: Outcome, attempt: number, maxAttempts: number): Next {
+  if (outcome.kind === "finished" && outcome.exitCode === 0) return { kind: "done" };
+  return attempt + 1 < maxAttempts
+    ? { kind: "askToFix", attempt: attempt + 1 }
+    : { kind: "giveUp" };
 }
-if (!passed) throw new Error("tests still fail: a human takes over");
-
-console.log(await ask("Push the change to a new branch fix/issue-42.", session, user));
 ```
 
 </td></tr></table>
@@ -361,7 +551,7 @@ resource "aws_bedrockagentcore_gateway_target" "github" {
 
 Terraform: [`aws_bedrockagentcore_gateway_target.github`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway_target), [`aws_bedrockagentcore_gateway`](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/bedrockagentcore_gateway) (the helpdesk-tools gateway from 03)
 
-The call itself is the same `tools/call` as in [07](07-policy.md), with the developer's Auth0 token (`open_pull_request` in `workflow.py`, `openPullRequest` in `workflow.ts`). **[verify]** the GitHub MCP server's tool name and arguments (`create_pull_request`: `owner`, `repo`, `title`, `head`, `base`), and how the Gateway asks for consent when a developer hasn't given it yet.
+The call itself is the same `tools/call` as in [07](07-policy.md), with the developer's Auth0 token (`open_pull_request` in `workflow.py`, `openPullRequest` in `workflow.ts`); the reply is parsed into `Opened | Refused`. **[verify]** the GitHub MCP server's tool name and arguments (`create_pull_request`: `owner`, `repo`, `title`, `head`, `base`), and how the Gateway asks for consent when a developer hasn't given it yet.
 
 ## Step 7: Run untrusted code in Code Interpreter
 

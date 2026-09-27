@@ -1,7 +1,6 @@
-// A coding agent: a git checkout in a persistent workspace, a GitHub token only when needed.
+// The coding agent (the imperative shell): Strands tools parse their arguments, then call core.
 import { execFile } from "node:child_process";
 import { mkdir } from "node:fs/promises";
-import path from "node:path";
 import { promisify } from "node:util";
 import { Agent, tool } from "@strands-agents/sdk";
 import { fileEditor } from "@strands-agents/sdk/vended-tools/file-editor";
@@ -9,6 +8,19 @@ import { CodeInterpreterTools } from "bedrock-agentcore/experimental/code-interp
 import { withAccessToken } from "bedrock-agentcore/identity";
 import { BedrockAgentCoreApp } from "bedrock-agentcore/runtime";
 import { z } from "zod";
+import { cloneArgv, commitSteps, describe, gitEnv } from "./core.ts";
+import {
+  type GitHubToken,
+  type Outcome,
+  ParseError,
+  WORKSPACE,
+  parseAllowedCommand,
+  parseBranchName,
+  parseCommitMessage,
+  parseGitHubToken,
+  parseRepo,
+  repoPath,
+} from "./domain.ts";
 
 const exec = promisify(execFile);
 
@@ -16,57 +28,40 @@ const MODEL_ID = "global.anthropic.claude-haiku-4-5-20251001-v1:0";
 const SYSTEM_PROMPT = `You are a careful software engineer working on one GitHub repository.
 Clone it, read the code, make the smallest change that fixes the task, run the tests, push a branch.
 Run code you did not write (snippets from issues, downloaded scripts) only in the code interpreter.`;
-const WORKSPACE = "/mnt/workspace"; // session storage: kept across stop/resume of the session
-const PROGRAMS = new Set([
-  "git",
-  "ls",
-  "cat",
-  "grep",
-  "npm",
-  "npx",
-  "node",
-  "python",
-  "pytest",
-  "uv",
-]);
 const SANDBOX_ID = process.env.CODE_INTERPRETER_ID ?? "coder_sandbox-AbCdEf1234";
 
-/** The user's GitHub token from the token vault. Never stored, never logged. */
-const githubToken = withAccessToken({
+// The user's GitHub token from the token vault, parsed at the boundary.
+const githubToken: () => Promise<GitHubToken> = withAccessToken({
   providerName: "github",
   scopes: ["repo"],
   authFlow: "USER_FEDERATION",
   // First use only: the user must allow GitHub access once. Send them this link.
   onAuthUrl: (url) => console.log(`GitHub consent needed: ${url}`),
-})(async (token: string) => token);
+})(async (token: string) => parseGitHubToken(token));
 
-function repoDir(repo: string): string {
-  const dir = path.resolve(WORKSPACE, repo.split("/").pop() ?? "");
-  if (path.dirname(dir) !== WORKSPACE) throw new Error(`not a repository name: ${repo}`);
-  return dir;
-}
-
-/** Run a program without a shell; return its exit code and the end of its output. */
-async function runProgram(argv: string[], cwd: string, env = process.env): Promise<string> {
+async function execute(argv: readonly string[], cwd: string, env = process.env): Promise<Outcome> {
   const [program = "", ...args] = argv;
   try {
     const { stdout, stderr } = await exec(program, args, { cwd, env, timeout: 900_000 });
-    return `exit 0\n${(stdout + stderr).slice(-4000)}`;
+    return { kind: "finished", exitCode: 0, output: stdout + stderr };
   } catch (error) {
-    const e = error as { code?: number; stdout?: string; stderr?: string };
-    return `exit ${e.code ?? 1}\n${((e.stdout ?? "") + (e.stderr ?? "")).slice(-4000)}`;
+    const e = error as { code?: number; killed?: boolean; stdout?: string; stderr?: string };
+    const output = (e.stdout ?? "") + (e.stderr ?? "");
+    return e.killed
+      ? { kind: "timedOut", output }
+      : { kind: "finished", exitCode: e.code ?? 1, output };
   }
 }
 
-/** Run git with the token in the child's environment only: not in argv, files or logs. */
-async function git(args: string[], cwd: string): Promise<string> {
-  const basic = Buffer.from(`x-access-token:${await githubToken()}`).toString("base64");
-  return runProgram(["git", ...args], cwd, {
-    ...process.env,
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_CONFIG_COUNT: "1",
-    GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader",
-    GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${basic}`,
+async function gitWithToken(argv: readonly string[], cwd: string): Promise<string> {
+  return describe(await execute(argv, cwd, { ...process.env, ...gitEnv(await githubToken()) }));
+}
+
+// Tool arguments come from the model: parse them into domain types first.
+function refusing(fn: () => Promise<string>): Promise<string> {
+  return fn().catch((error: unknown) => {
+    if (error instanceof ParseError) return `refused: ${error.message}`;
+    throw error;
   });
 }
 
@@ -74,37 +69,40 @@ const clone = tool({
   name: "clone",
   description: "Clone a GitHub repository into the workspace.",
   inputSchema: z.object({ repo: z.string().describe("owner/name, e.g. fintech/helpdesk-api") }),
-  callback: async ({ repo }) => {
-    await mkdir(WORKSPACE, { recursive: true });
-    return git(["clone", `https://github.com/${repo}.git`, repoDir(repo)], WORKSPACE);
-  },
+  callback: ({ repo }) =>
+    refusing(async () => {
+      const target = parseRepo(repo);
+      await mkdir(WORKSPACE, { recursive: true });
+      return gitWithToken(cloneArgv(target), WORKSPACE);
+    }),
 });
 
 const push = tool({
   name: "push",
   description: "Commit every change in the repository to a new branch and push it.",
   inputSchema: z.object({ repo: z.string(), branch: z.string(), message: z.string() }),
-  callback: async ({ repo, branch, message }) => {
-    const cwd = repoDir(repo);
-    for (const args of [
-      ["switch", "-c", branch],
-      ["add", "-A"],
-      ["commit", "-m", message],
-    ]) {
-      await exec("git", args, { cwd });
-    }
-    return git(["push", "origin", branch], cwd);
-  },
+  callback: ({ repo, branch, message }) =>
+    refusing(async () => {
+      const path = repoPath(parseRepo(repo));
+      const newBranch = parseBranchName(branch);
+      for (const step of commitSteps(newBranch, parseCommitMessage(message))) {
+        const outcome = await execute(step, path);
+        if (!(outcome.kind === "finished" && outcome.exitCode === 0)) return describe(outcome);
+      }
+      return gitWithToken(["git", "push", "origin", newBranch], path);
+    }),
 });
 
 const run = tool({
   name: "run",
-  description: 'Run one program in a cloned repository, e.g. ["npm", "test"]. No shell.',
-  inputSchema: z.object({ repo: z.string(), argv: z.array(z.string()).min(1) }),
-  callback: async ({ repo, argv }) =>
-    PROGRAMS.has(argv[0] ?? "")
-      ? runProgram(argv, repoDir(repo))
-      : `not allowed; use one of ${[...PROGRAMS].join(", ")}`,
+  description: 'Run one allowed program in a cloned repository, e.g. ["npm", "test"]. No shell.',
+  inputSchema: z.object({ repo: z.string(), argv: z.array(z.string()) }),
+  callback: ({ repo, argv }) =>
+    refusing(async () => {
+      const path = repoPath(parseRepo(repo));
+      const command = parseAllowedCommand(argv);
+      return describe(await execute([command.program, ...command.args], path));
+    }),
 });
 
 const sandbox = new CodeInterpreterTools({ region: "eu-west-1", identifier: SANDBOX_ID });

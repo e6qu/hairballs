@@ -4,9 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/agent.js",
-    "workflow": "node dist/workflow.js"
+    "agent": "tsx agent.ts",
+    "workflow": "tsx workflow.ts"
   },
   "dependencies": {
     "@aws-sdk/client-bedrock-agentcore": "3.1141.0",
@@ -16,6 +15,7 @@
   },
   "devDependencies": {
     "@types/node": "22.20.4",
+    "tsx": "4.23.15",
     "typescript": "5.9.3"
   }
 }
