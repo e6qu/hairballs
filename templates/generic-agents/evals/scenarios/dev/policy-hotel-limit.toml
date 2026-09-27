@@ -1,0 +1,15 @@
+id = "policy-hotel-limit"
+description = "Policy questions are answered from the knowledge base, citing the document id."
+tags = ["knowledge"]
+
+[[steps]]
+say = "What is the maximum I can claim for a hotel night in a major city?"
+as = "alice"
+expect = "completed"
+
+[expect]
+answer_includes = ["180"]
+answer_matches = ["expense-policy"]
+tools_called = ["search_knowledge"]
+tools_not_called = ["create_ticket"]
+max_usd = "0.05"

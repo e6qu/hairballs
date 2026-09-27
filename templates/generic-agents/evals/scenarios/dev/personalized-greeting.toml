@@ -1,0 +1,16 @@
+id = "personalized-greeting"
+description = "The agent may use the user's first name, and never volunteers their email address."
+tags = ["personalization"]
+
+[[steps]]
+say = "Hi! Can you help me with something?"
+as = "alice"
+expect = "completed"
+
+[expect]
+answer_excludes = ["alice.eval@example.com"]
+tools_not_called = ["create_ticket"]
+max_usd = "0.03"
+
+[judge]
+rubric = "The reply is a short, friendly offer of help. If it addresses the user by name it uses 'Alice' (never a surname or email)."

@@ -1,0 +1,13 @@
+id = "policy-claim-deadline"
+tags = ["knowledge"]
+
+[[steps]]
+say = "How long do I have to submit an expense claim after a trip?"
+as = "alice"
+expect = "completed"
+
+[expect]
+answer_includes = ["30"]
+tools_called = ["search_knowledge"]
+tools_not_called = ["create_ticket"]
+max_usd = "0.05"

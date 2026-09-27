@@ -1,0 +1,17 @@
+# Synthetic test users (never real people). Subjects match the approvers in each variant's config.
+
+[alice]
+subject = "auth0|eval-alice"
+email = "alice.eval@example.com"
+given_name = "Alice"
+family_name = "Tester"
+
+[bob]
+subject = "auth0|eval-bob"
+email = "bob.eval@example.com"
+given_name = "Bob"
+
+[lead]
+subject = "auth0|service-desk-lead"
+email = "service-desk-lead@example.com"
+given_name = "Lee"
