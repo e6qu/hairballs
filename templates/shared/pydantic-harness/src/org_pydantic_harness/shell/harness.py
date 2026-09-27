@@ -9,13 +9,17 @@ What it adds over plain Pydantic AI usage:
 * session persistence (thread state + message history) through a :class:`SessionStore`;
 * context management (tool-output truncation + sliding window) as a history processor;
 * steering mid-run messages into the running agent; follow-ups queued for other senders;
+* caller identity: each message comes with its sender's ``Caller`` (from the token). The run
+  owner's caller reaches tools (``HarnessDeps.caller``) and approval requests (``requester``), and
+  the model is told the speaker's first name at the start of a thread and whenever the speaker
+  changes, in the user message (never the system prompt, so the prompt cache is shared);
 * cancellation (``AgentRun.cancel``): the reply is ``stopped`` / ``cancelled``; a cancel while
   awaiting approval returns the thread to idle and answers the pending calls as not executed;
 * failures: an exception from the model or framework ends the run as ``Failed`` (thread idle,
   partial history kept with unanswered tool calls closed, follow-ups kept); Pydantic
   AI's own ``UsageLimitExceeded`` becomes a ``framework_limit`` stop.
 
-The runner is synchronous (``handle(Incoming) -> Reply``); each run segment is driven with
+The runner is synchronous (``handle(Incoming, Caller) -> Reply``); each run segment is driven with
 ``agent.iter`` on a private event loop.
 """
 
@@ -56,6 +60,7 @@ from org_agents.core.messages import (
 from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalDecision, ApprovalId, PrincipalId, SessionId, ToolName
+from org_agents.identity import Caller, first_prompt_preamble
 from org_agents.parsing import ParseError
 from org_agents.shell.audit import AuditSink, ContextCompactedEvent
 from org_agents.shell.clock import Clock
@@ -173,6 +178,10 @@ class Harness:
         loaded = store.load(session)
         self._state = recover(loaded.thread) if loaded else ThreadState.initial()
         self._messages: list[ModelMessage] = list(loaded.messages) if loaded else []
+        # Who each sender is (profile from their latest token); the run owner's caller is the requester.
+        self._callers: dict[PrincipalId, Caller] = {c.subject: c for c in loaded.callers} if loaded else {}
+        # The sender the model was last told it is assisting (see ``_introduce``).
+        self._introduced: PrincipalId | None = loaded.introduced if loaded else None
 
     # ------------------------------------------------------------------ inspection
 
@@ -190,8 +199,12 @@ class Harness:
 
     # ------------------------------------------------------------------ entry point
 
-    def handle(self, message: Incoming) -> Reply:
+    def handle(self, message: Incoming, caller: Caller) -> Reply:
+        """``caller`` is the resolved identity of ``message.sender`` (from the same token)."""
+        if caller.subject != message.sender:
+            raise ValueError("caller does not match the message sender")
         with self._lock:
+            self._callers[message.sender] = caller
             before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
             if isinstance(action, CancelRun):
@@ -239,17 +252,32 @@ class Harness:
         guard = RunGuard(
             self._session, cfg.limits, cfg.price, cfg.tools, self._clock, self._audit, self._kill_switch
         )
-        outcome, messages = _run_coroutine(self._drive(start, guard, owner))
+        caller = self._callers.get(owner)
+        if isinstance(start, _NewPrompt):
+            start = _NewPrompt(self._introduce(owner, caller, start.text))
+        outcome, messages = _run_coroutine(
+            self._drive(start, guard, HarnessDeps(self._session, owner, caller))
+        )
         guard.finish()
         with self._lock:
             self._steering.end_run()
             self._messages = messages
-            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
+            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals, caller)
             self._save_locked()
         return reply
 
+    def _introduce(self, owner: PrincipalId, caller: Caller | None, prompt: str) -> str:
+        """Prefix the first prompt of a thread (and of each new speaker) with who the model is assisting.
+        Only the first name is shared, and only in the user message: the system prompt stays identical
+        for every user, so the prompt cache is shared."""
+        if self._introduced == owner:
+            return prompt
+        self._introduced = owner
+        preamble = first_prompt_preamble(caller) if caller is not None else None
+        return f"{preamble}\n\n{prompt}" if preamble else prompt
+
     async def _drive(
-        self, start: _Start, guard: RunGuard, owner: PrincipalId
+        self, start: _Start, guard: RunGuard, deps: HarnessDeps
     ) -> tuple[RunOutcome, list[ModelMessage]]:
         history = list(self._messages)
         match start:
@@ -264,7 +292,7 @@ class Harness:
                 prompt,
                 message_history=history,
                 deferred_tool_results=results,
-                deps=HarnessDeps(self._session, owner),
+                deps=deps,
                 capabilities=[GuardCapability(guard)],
                 conversation_id=self._session.value,
             ) as run:
@@ -287,6 +315,8 @@ class Harness:
             public, detail = describe_failure(exc)
             guard.fail(detail)
             # Keep what happened (a tool that ran stays in the history), close unanswered calls.
+            if run is None:  # the prompt (and any introduction) never reached the history
+                self._introduced = None
             partial = run.all_messages() if run is not None else history
             return Failed(public), close_unanswered_calls(partial, NOT_RUN_FAILED)
         if result is None:  # pragma: no cover - iteration always ends with a result
@@ -322,7 +352,9 @@ class Harness:
         return Completed(output.strip())
 
     def _save_locked(self) -> None:
-        self._store.save(self._session, snapshot(self._state, self._messages))
+        self._store.save(
+            self._session, snapshot(self._state, self._messages, self._callers.values(), self._introduced)
+        )
 
 
 def create_harness(

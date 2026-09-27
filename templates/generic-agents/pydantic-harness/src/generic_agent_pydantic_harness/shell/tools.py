@@ -2,7 +2,8 @@
 
 The function signatures are the schema Pydantic AI shows the model (framework-required, so they
 live here). Each adapter passes the raw values straight to ``GenericTools``, which parses them into
-domain types. Principal and session come from ``RunContext[HarnessDeps]`` as domain types.
+domain types. The caller (set by the harness from the verified token, never the model) and session
+come from ``RunContext[HarnessDeps]`` as domain types.
 A ``ToolFailure`` becomes ``ToolFailed``: a failed tool result the model sees, without a retry.
 
 Limits, the allowlist, loop detection and the four-eyes approval for ``create_ticket`` are not
@@ -11,6 +12,7 @@ here: the org harness applies them to every tool.
 
 from __future__ import annotations
 
+from generic_tools.domain import Requester
 from generic_tools.shell.service import TOOL_DESCRIPTIONS, GenericTools, ToolResult, ToolSuccess
 from org_agents.core.idempotency import idempotency_key
 from org_agents.domain import ToolName
@@ -36,9 +38,12 @@ def build_tools(service: GenericTools) -> list[Tool[HarnessDeps]]:
     def create_ticket(
         ctx: RunContext[HarnessDeps], title: str, description: str, priority: str = "normal"
     ) -> str:
+        caller = ctx.deps.caller
+        if caller is None:
+            raise ToolFailed("the requester is unknown; the ticket was not created")
         args = {"title": title, "description": description, "priority": priority}
         key = idempotency_key(ctx.deps.session, ToolName("create_ticket"), fingerprint_arguments(args))
-        return _out(service.create_ticket(args, ctx.deps.principal.value, key.value))
+        return _out(service.create_ticket(args, Requester.from_caller(caller), key.value))
 
     def get_ticket(ticket_id: str) -> str:
         return _out(service.get_ticket({"ticket_id": ticket_id}))

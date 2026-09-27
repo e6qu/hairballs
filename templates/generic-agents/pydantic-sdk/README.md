@@ -22,7 +22,7 @@ A generic, tool-using internal assistant on **Pydantic AI** (`pydantic-ai-slim[b
 | Caching | `BedrockModelSettings(bedrock_cache_instructions=True, bedrock_cache_tool_definitions=True, bedrock_cache_messages=True)`. Instructions are stable and the tool list is fixed |
 | Usage | Pydantic AI reports `input_tokens` *including* cache reads/writes; `core/usage.py` converts to the org's disjoint buckets so each token is priced once |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
-| Identity | The caller's Auth0 JWT (validated by the AgentCore Runtime `customJWTAuthorizer`) is forwarded in `Authorization`. `sub` becomes the principal, carried to tools in the typed `RunDeps`. See [`AGENT_IDENTITY_AUTH0.md`](../../../AGENT_IDENTITY_AUTH0.md) |
+| Identity | The caller's Auth0 JWT (validated by the AgentCore Runtime `customJWTAuthorizer`) is forwarded in `Authorization`. `sub` is the principal (ownership, approvals). The profile comes from namespaced claims (`[identity].claim_namespace`): a **required** email, optional given and family names, and an optional user id. If the token has no user id, one is remembered or minted per `sub` (`USERS_DB`), so email and name can change. Principal and caller reach tools in the typed `RunDeps`; the ticket requester and approval replies show name and email. The model gets the first name in the first user message from each speaker, never in the system prompt. Audit logs never contain PII. Without a token the caller is a local dev user; set `REQUIRE_TOKEN=true` to refuse such requests. See [`AGENT_IDENTITY_AUTH0.md`](../../../AGENT_IDENTITY_AUTH0.md) §2.1 |
 
 ## Code layout (functional core, imperative shell)
 
@@ -38,7 +38,7 @@ This variant contains only the Pydantic AI-specific code:
 src/generic_agent_pydantic/
 ├── core/usage.py      # pure: inclusive → disjoint token usage; UsageLimitExceeded message → StopRun
 └── shell/
-    ├── deps.py        # RunDeps (session, principal, guard): the typed deps_type
+    ├── deps.py        # RunDeps (session, principal, caller, guard): the typed deps_type
     ├── capability.py  # GuardCapability ↔ RunGuard (limits, policy, approval deferral) + UsageLimits
     ├── tools.py       # Pydantic AI Tool adapters → generic_tools service (raw args parsed there)
     ├── runner.py      # one thread = one history; agent.iter, deferred results, enqueue, cancel

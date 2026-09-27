@@ -9,14 +9,18 @@ import pytest
 from org_agents.core.messages import AwaitingApproval, Idle, Running
 from org_agents.core.thread import QueuedPrompt, ThreadState
 from org_agents.domain import ApprovalId, MessageId, PrincipalId, Prompt, SessionId
+from org_agents.identity import Caller, EmailAddress, HumanUser, PersonName, ServiceClient, UserId
 from org_agents.parsing import ParseError
 from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from org_pydantic_harness.shell.sessions import (
     JsonFileSessionStore,
     SessionSnapshot,
+    caller_to_json,
+    parse_caller,
     parse_snapshot,
     parse_thread,
+    snapshot,
     snapshot_to_json,
     thread_to_json,
 )
@@ -58,3 +62,38 @@ def test_snapshot_is_parsed_at_the_boundary() -> None:
         parse_snapshot({**doc, "messages": [{"kind": "nonsense"}]}, SESSION)
     with pytest.raises(ParseError, match=r"\$\.thread\.status\.kind"):
         parse_snapshot({**doc, "thread": {"status": {"kind": "?"}, "seen": [], "follow_ups": []}}, SESSION)
+
+
+ALICE_USER = HumanUser(
+    UserId("usr_alice"), ALICE, EmailAddress("alice@example.com"), PersonName("Alice"), None
+)
+BOT = ServiceClient(PrincipalId("bot@clients"))
+
+
+@pytest.mark.parametrize("caller", [ALICE_USER, BOT])
+def test_caller_round_trip(caller: Caller) -> None:
+    assert parse_caller(json.loads(json.dumps(caller_to_json(caller))), "$.c") == caller
+
+
+def test_callers_and_introduction_round_trip_and_only_needed_callers_are_kept(tmp_path: Path) -> None:
+    lead = HumanUser(UserId("usr_lead"), PrincipalId("auth0|lead"), EmailAddress("l@example.com"), None, None)
+    state = ThreadState(Running(ALICE), frozenset(), (QueuedPrompt(BOT.subject, Prompt("later")),))
+    snap = snapshot(state, (), [ALICE_USER, lead, BOT], ALICE)
+    assert snap.callers == (ALICE_USER, BOT)  # the approver's profile is not persisted
+    store = JsonFileSessionStore(tmp_path)
+    store.save(SESSION, snap)
+    assert store.load(SESSION) == snap
+
+
+def test_version_1_snapshots_load_without_callers() -> None:
+    doc = snapshot_to_json(SESSION, SessionSnapshot(ThreadState.initial(), ()))
+    legacy = {k: v for k, v in doc.items() if k not in {"callers", "introduced"}} | {"version": 1}
+    loaded = parse_snapshot(legacy, SESSION)
+    assert loaded.callers == () and loaded.introduced is None
+
+
+def test_stored_callers_are_parsed() -> None:
+    doc = snapshot_to_json(SESSION, SessionSnapshot(ThreadState.initial(), ()))
+    bad = {"kind": "user", "subject": "auth0|x", "user_id": "usr_x", "email": "not-an-email"}
+    with pytest.raises(ParseError, match=r"\$\.callers\[0\]\.email"):
+        parse_snapshot({**doc, "callers": [bad]}, SESSION)

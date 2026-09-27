@@ -44,7 +44,7 @@ The harness context management adds two **read-only** tools: `retrieve_context` 
 | Context | The `"auto"` context-manager strategies (metered, audited) plus `ContextOffloader` (see above) |
 | Caching | `CacheConfig(strategy="auto", tools_ttl=True)`. The system prompt is stable and the tool list is fixed |
 | Audit | JSON-lines audit events on stdout (CloudWatch via AgentCore Runtime) |
-| Identity | The caller's Auth0 JWT (validated by the AgentCore Runtime `customJWTAuthorizer`) is forwarded in `Authorization`. `sub` becomes the principal |
+| Identity | The caller's Auth0 JWT (validated by the AgentCore Runtime `customJWTAuthorizer`) is forwarded in `Authorization`. `sub` is the principal (ownership, approvals). The profile comes from namespaced claims (`[identity].claim_namespace`): a **required** email, optional given and family names, and an optional user id. If the token has no user id, one is remembered or minted per `sub` (`USERS_DB`), so email and name can change. The ticket requester and approval replies show name and email. The model gets the first name in the first user message from each speaker, never in the system prompt. Audit logs never contain PII. Without a token the caller is a local dev user; set `REQUIRE_TOKEN=true` to refuse such requests. See [`AGENT_IDENTITY_AUTH0.md`](../../../AGENT_IDENTITY_AUTH0.md) §2.1 |
 
 ## Code layout (functional core, imperative shell)
 

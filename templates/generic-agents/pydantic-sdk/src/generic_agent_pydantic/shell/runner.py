@@ -13,6 +13,10 @@ result back into a domain ``RunOutcome``.
   the reply is ``stopped`` / ``cancelled``. Cancel while awaiting approval returns the thread to idle.
 * Failure: an exception from the model or framework ends the run as ``Failed`` with the partial
   history kept (the thread is idle again; queued follow-ups still run).
+* Identity: each message comes with its sender's ``Caller``. The run owner's caller reaches tools
+  (``RunDeps.caller``) and approval requests (``requester``). The model is told the speaker's first
+  name in the first prompt of the thread and whenever the speaker changes: in the user message,
+  never the system prompt, so the prompt cache is shared across users.
 
 Whenever a run ends early (cancel, failure, usage limit, abandoned approval), tool calls without a
 result are answered "not executed" (:func:`close_unanswered_calls`): Pydantic AI refuses a new
@@ -53,6 +57,7 @@ from org_agents.core.messages import (
 from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalDecision, ApprovalId, PrincipalId, SessionId, ToolName
+from org_agents.identity import Caller, first_prompt_preamble
 from org_agents.shell.audit import AuditSink
 from org_agents.shell.clock import Clock
 from org_agents.shell.run_guard import RunGuard
@@ -150,6 +155,10 @@ class SessionRunner:
         self._active: AgentRun[RunDeps, Output] | None = None
         self._steering: list[str] = []
         self._cancel_pending = False  # a cancel accepted before the run attached
+        # Who each sender is (profile from their latest token); the run owner's caller is the requester.
+        self._callers: dict[PrincipalId, Caller] = {}
+        # The sender the model was last told it is assisting (see ``_introduce``).
+        self._introduced: PrincipalId | None = None
 
     @property
     def state(self) -> ThreadState:
@@ -159,8 +168,12 @@ class SessionRunner:
     def history(self) -> list[ModelMessage]:
         return list(self._history)
 
-    def handle(self, message: Incoming) -> Reply:
+    def handle(self, message: Incoming, caller: Caller) -> Reply:
+        """``caller`` is the resolved identity of ``message.sender`` (from the same token)."""
+        if caller.subject != message.sender:
+            raise ValueError("caller does not match the message sender")
         with self._lock:
+            self._callers[message.sender] = caller
             before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
             if isinstance(action, CancelRun):
@@ -252,11 +265,22 @@ class SessionRunner:
         guard = RunGuard(
             self._session, cfg.limits, cfg.price, cfg.tools, self._clock, self._audit, self._kill_switch
         )
-        outcome = asyncio.run(self._drive(prompt, deferred, RunDeps(self._session, owner, guard)))
+        caller = self._callers[owner]
+        if prompt is not None:
+            prompt = self._introduce(caller, prompt)
+        outcome = asyncio.run(self._drive(prompt, deferred, RunDeps(self._session, owner, caller, guard)))
         guard.finish()
         with self._lock:
-            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
+            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals, caller)
         return reply
+
+    def _introduce(self, caller: Caller, prompt: str) -> str:
+        """Prefix the first prompt of a thread (and of each new speaker) with who the model is assisting."""
+        if self._introduced == caller.subject:
+            return prompt
+        self._introduced = caller.subject
+        preamble = first_prompt_preamble(caller)
+        return f"{preamble}\n\n{prompt}" if preamble else prompt
 
     async def _drive(
         self, prompt: str | None, deferred: DeferredToolResults | None, deps: RunDeps
@@ -293,6 +317,8 @@ class SessionRunner:
         except Exception as exc:  # model provider / framework error (throttling, validation, network…)
             public, detail = describe_failure(exc)
             deps.guard.fail(detail)
+            if run is None:  # the prompt (and any introduction) never reached the history
+                self._introduced = None
             partial = run.all_messages() if run is not None else self._history
             self._history, self._pending = close_unanswered_calls(partial, NOT_RUN_FAILED), None
             return Failed(public)

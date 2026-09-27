@@ -2,16 +2,19 @@
 
 The ``@tool`` signatures are the schema Strands shows the model (framework-required, so they live
 here). Each adapter passes the raw values straight to ``GenericTools``, which parses them into
-domain types. Principal and session come from ``invocation_state`` and are parsed too.
+domain types. The caller (set by the runner, never the model) and session come from
+``invocation_state``.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from generic_tools.domain import Requester
 from generic_tools.shell.service import TOOL_DESCRIPTIONS, GenericTools, ToolResult, ToolSuccess
 from org_agents.core.idempotency import idempotency_key
-from org_agents.domain import PrincipalId, SessionId, ToolName
+from org_agents.domain import SessionId, ToolName
+from org_agents.identity import HumanUser, ServiceClient
 from org_agents.shell.fingerprint import fingerprint_arguments
 from strands import tool
 from strands.types.tools import AgentTool, ToolContext
@@ -41,11 +44,13 @@ def build_tools(service: GenericTools) -> list[AgentTool]:
         title: str, description: str, tool_context: ToolContext, priority: str = "normal"
     ) -> str:
         state: dict[str, Any] = tool_context.invocation_state
-        principal = PrincipalId.parse(state.get("principal"), "$.invocation_state.principal")
+        caller = state.get("caller")
+        if not isinstance(caller, (HumanUser, ServiceClient)):
+            raise ToolError("the requester is unknown; the ticket was not created")
         session = SessionId.parse(state.get("session"), "$.invocation_state.session")
         args = {"title": title, "description": description, "priority": priority}
         key = idempotency_key(session, ToolName("create_ticket"), fingerprint_arguments(args))
-        return _out(service.create_ticket(args, principal.value, key.value))
+        return _out(service.create_ticket(args, Requester.from_caller(caller), key.value))
 
     @tool(name="get_ticket", description=TOOL_DESCRIPTIONS["get_ticket"])
     def get_ticket(ticket_id: str) -> str:

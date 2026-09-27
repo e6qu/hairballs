@@ -39,6 +39,7 @@ from org_agents.core.messages import (
 from org_agents.core.redaction import redact
 from org_agents.core.thread import ThreadState, finish, merge_answers, next_follow_up, receive
 from org_agents.domain import ApprovalId, PrincipalId, SessionId, ToolName
+from org_agents.identity import Caller, first_prompt_preamble
 from org_agents.parsing import ParseError, expect_mapping
 from org_agents.shell.audit import AuditSink, ContextCompactedEvent
 from org_agents.shell.clock import Clock
@@ -89,6 +90,11 @@ class SessionRunner:
         self._cancel = threading.Event()
         # Agent state before the current prompt: restored when its run fails or its approval is cancelled.
         self._rollback: Snapshot | None = None
+        # Who each sender is (profile from their latest token); the run owner's caller is the requester.
+        self._callers: dict[PrincipalId, Caller] = {}
+        # The sender the model was last told it is assisting (the preamble goes in a user message,
+        # never the system prompt, so the prompt cache stays shared across users).
+        self._introduced: PrincipalId | None = None
 
     def _compacted(self, before: int, after: int) -> None:
         self._audit.emit(ContextCompactedEvent(self._session, before, after, self._clock.now()))
@@ -101,8 +107,11 @@ class SessionRunner:
     def tool_names(self) -> frozenset[str]:
         return frozenset(self._agent.tool_names)
 
-    def handle(self, message: Incoming) -> Reply:
+    def handle(self, message: Incoming, caller: Caller) -> Reply:
+        if caller.subject != message.sender:
+            raise ValueError("caller does not match the message sender")
         with self._lock:
+            self._callers[message.sender] = caller
             before = self._state.status
             self._state, action = receive(self._state, message, self._settings.agent.busy_policy)
             if isinstance(action, CancelRun):
@@ -152,13 +161,15 @@ class SessionRunner:
             self._session, cfg.limits, cfg.price, cfg.tools, self._clock, self._audit, self._kill_switch
         )
         self._hooks.begin(guard)
+        caller = self._callers[owner]
         if isinstance(agent_input, str):  # a new prompt (not an approval resume)
             self._rollback = self._agent.take_snapshot(preset="session")
+            agent_input = self._introduce(caller, agent_input)
         cancel = self._cancel
         try:
             result = self._agent(
                 agent_input,
-                invocation_state={"principal": owner.value, "session": self._session.value},
+                invocation_state={"caller": caller, "session": self._session.value},
                 cancel_signal=cancel,
             )
         except Exception as exc:  # framework / model provider error (throttling, validation, network…)
@@ -172,8 +183,16 @@ class SessionRunner:
         guard.finish()
         with self._lock:
             self._cancel = threading.Event()
-            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals)
+            self._state, reply = finish(self._state, outcome, owner, self._settings.approvals, caller)
         return reply
+
+    def _introduce(self, caller: Caller, prompt: str) -> str:
+        """Prefix the first prompt of a thread (and of each new speaker) with who the model is assisting."""
+        if self._introduced == caller.subject:
+            return prompt
+        self._introduced = caller.subject
+        preamble = first_prompt_preamble(caller)
+        return f"{preamble}\n\n{prompt}" if preamble else prompt
 
     def _failed(self, exc: Exception, guard: RunGuard) -> Failed:
         public, detail = describe_failure(exc)
@@ -190,6 +209,7 @@ class SessionRunner:
         if self._rollback is not None:
             self._agent.load_snapshot(self._rollback)
             self._rollback = None
+            self._introduced = None  # the introduction may have been rolled back with the prompt
 
     @staticmethod
     def _outcome(result: Any, guard: RunGuard) -> RunOutcome:

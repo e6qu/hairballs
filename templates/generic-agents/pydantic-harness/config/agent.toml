@@ -28,6 +28,11 @@ approval_required = ["create_ticket"]
 self_approval = false           # four-eyes: the requester cannot approve their own ticket
 approvers = ["auth0|service-desk-lead"]
 
+[identity]
+# Namespace of the custom claims the Auth0 post-login Action adds to access tokens:
+# <ns>email (required for people), <ns>given_name, <ns>family_name, <ns>user_id (optional).
+claim_namespace = "https://fintech.example/"
+
 [context]                       # org-pydantic-harness context management
 max_tool_output_chars = 2000    # longer tool results → head + tail with an "omitted" marker
 keep_head_chars = 1200

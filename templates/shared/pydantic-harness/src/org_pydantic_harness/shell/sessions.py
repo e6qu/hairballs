@@ -5,6 +5,10 @@ A snapshot holds two things:
 * the org ``ThreadState`` (status, seen message ids, queued follow-ups), serialized by the small
   ``thread_to_json`` / ``parse_thread`` pair below (domain in, JSON out, parsed back into domain
   types; no DTO mirror classes);
+* who the thread's pending work is for: the ``Caller`` of the run owner and of queued senders
+  (so an approval or follow-up after a restart still knows its requester), and the speaker the
+  model was last introduced to. Callers carry PII (name, email); the store holds the conversation
+  anyway, so it must be protected like it. Callers are parsed back into domain types on load;
 * the framework's own message history, serialized with Pydantic AI's ``ModelMessagesTypeAdapter``
   (``pydantic_ai/messages.py``). That format belongs to the framework, so the framework's adapter
   is the right parser for it; it never leaves this module and the harness.
@@ -21,7 +25,7 @@ import json
 import os
 import tempfile
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -29,17 +33,21 @@ from typing import Protocol
 from org_agents.core.messages import AwaitingApproval, Idle, Running, ThreadStatus
 from org_agents.core.thread import QueuedPrompt, ThreadState
 from org_agents.domain import ApprovalId, MessageId, PrincipalId, Prompt, SessionId
+from org_agents.identity import Caller, EmailAddress, HumanUser, PersonName, ServiceClient, UserId
 from org_agents.parsing import ParseError, expect_int, expect_mapping, expect_sequence, expect_str, field
 from pydantic import ValidationError
 from pydantic_ai.messages import ModelMessage, ModelMessagesTypeAdapter
 
-_FORMAT_VERSION = 1
+_FORMAT_VERSION = 2
+_READABLE_VERSIONS = frozenset({1, _FORMAT_VERSION})  # version 1 had no callers
 
 
 @dataclass(frozen=True, slots=True)
 class SessionSnapshot:
     thread: ThreadState
     messages: tuple[ModelMessage, ...]
+    callers: tuple[Caller, ...] = ()  # at most one per subject
+    introduced: PrincipalId | None = None  # the speaker the model was last told it is assisting
 
 
 class SessionStore(Protocol):
@@ -111,6 +119,52 @@ def parse_thread(raw: object, path: str = "$.thread") -> ThreadState:
     )
 
 
+# ---------------------------------------------------------------- callers <-> JSON
+
+
+def caller_to_json(caller: Caller) -> dict[str, object]:
+    match caller:
+        case HumanUser(user_id=user_id, subject=subject, email=email, given_name=given, family_name=family):
+            return {
+                "kind": "user",
+                "subject": subject.value,
+                "user_id": user_id.value,
+                "email": email.value,
+                "given_name": given.value if given else None,
+                "family_name": family.value if family else None,
+            }
+        case ServiceClient(subject=subject):
+            return {"kind": "service", "subject": subject.value}
+
+
+def parse_caller(raw: object, path: str) -> Caller:
+    fields = expect_mapping(raw, path)
+    kind = expect_str(field(fields, "kind", path), f"{path}.kind")
+    subject = PrincipalId.parse(field(fields, "subject", path), f"{path}.subject")
+    if kind == "service":
+        return ServiceClient(subject)
+    if kind != "user":
+        raise ParseError(f"{path}.kind", "must be user or service")
+    given, family = fields.get("given_name"), fields.get("family_name")
+    return HumanUser(
+        user_id=UserId.parse(field(fields, "user_id", path), f"{path}.user_id"),
+        subject=subject,
+        email=EmailAddress.parse(field(fields, "email", path), f"{path}.email"),
+        given_name=PersonName.parse(given, f"{path}.given_name") if given is not None else None,
+        family_name=PersonName.parse(family, f"{path}.family_name") if family is not None else None,
+    )
+
+
+def needed_callers(thread: ThreadState, callers: Iterable[Caller]) -> tuple[Caller, ...]:
+    """The callers a restarted process needs: the run owner's and queued senders'. Nobody else's
+    profile is persisted (data minimisation)."""
+    status = thread.status
+    wanted = {q.sender for q in thread.follow_ups}
+    if isinstance(status, Running | AwaitingApproval):
+        wanted.add(status.owner)
+    return tuple(sorted((c for c in callers if c.subject in wanted), key=lambda c: c.subject.value))
+
+
 # ---------------------------------------------------------------- snapshot <-> JSON
 
 
@@ -120,13 +174,15 @@ def snapshot_to_json(session: SessionId, snapshot: SessionSnapshot) -> dict[str,
         "version": _FORMAT_VERSION,
         "session": session.value,
         "thread": thread_to_json(snapshot.thread),
+        "callers": [caller_to_json(c) for c in snapshot.callers],
+        "introduced": snapshot.introduced.value if snapshot.introduced else None,
         "messages": messages,
     }
 
 
 def parse_snapshot(raw: object, session: SessionId) -> SessionSnapshot:
     doc = expect_mapping(raw, "$")
-    if expect_int(field(doc, "version", "$"), "$.version") != _FORMAT_VERSION:
+    if expect_int(field(doc, "version", "$"), "$.version") not in _READABLE_VERSIONS:
         raise ParseError("$.version", f"unsupported session format (expected {_FORMAT_VERSION})")
     if SessionId.parse(field(doc, "session", "$"), "$.session") != session:
         raise ParseError("$.session", "belongs to a different session")
@@ -134,7 +190,14 @@ def parse_snapshot(raw: object, session: SessionId) -> SessionSnapshot:
         messages = ModelMessagesTypeAdapter.validate_python(field(doc, "messages", "$"))
     except ValidationError as exc:
         raise ParseError("$.messages", f"invalid message history: {exc.error_count()} error(s)") from exc
-    return SessionSnapshot(parse_thread(field(doc, "thread", "$")), tuple(messages))
+    callers = expect_sequence(doc.get("callers", []), "$.callers")
+    introduced = doc.get("introduced")
+    return SessionSnapshot(
+        parse_thread(field(doc, "thread", "$")),
+        tuple(messages),
+        tuple(parse_caller(c, f"$.callers[{i}]") for i, c in enumerate(callers)),
+        PrincipalId.parse(introduced, "$.introduced") if introduced is not None else None,
+    )
 
 
 # ---------------------------------------------------------------- stores
@@ -193,5 +256,10 @@ class JsonFileSessionStore:
                 raise
 
 
-def snapshot(thread: ThreadState, messages: Sequence[ModelMessage]) -> SessionSnapshot:
-    return SessionSnapshot(thread, tuple(messages))
+def snapshot(
+    thread: ThreadState,
+    messages: Sequence[ModelMessage],
+    callers: Iterable[Caller] = (),
+    introduced: PrincipalId | None = None,
+) -> SessionSnapshot:
+    return SessionSnapshot(thread, tuple(messages), needed_callers(thread, callers), introduced)

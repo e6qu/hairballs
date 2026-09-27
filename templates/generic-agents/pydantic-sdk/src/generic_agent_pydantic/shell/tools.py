@@ -2,7 +2,8 @@
 
 The function signatures are the schema Pydantic AI shows the model (framework-required, so they live
 here). Each adapter passes the raw values straight to ``GenericTools``, which parses them into domain
-types. Principal and session come from the typed ``RunDeps``.
+types. The caller (set by the runner from the verified token, never the model) and session come
+from the typed ``RunDeps``.
 
 Failures are raised as ``ToolFailed``: the model sees a failed tool result (``outcome='failed'``)
 without consuming its retry budget.
@@ -10,6 +11,7 @@ without consuming its retry budget.
 
 from __future__ import annotations
 
+from generic_tools.domain import Requester
 from generic_tools.shell.service import TOOL_DESCRIPTIONS, GenericTools, ToolResult, ToolSuccess
 from org_agents.core.idempotency import idempotency_key
 from org_agents.domain import ToolName
@@ -39,7 +41,7 @@ def build_tools(service: GenericTools) -> list[Tool[RunDeps]]:
         # Only reached after the guard capability saw an approval (deferred tool flow, see capability.py).
         args = {"title": title, "description": description, "priority": priority}
         key = idempotency_key(ctx.deps.session, ToolName("create_ticket"), fingerprint_arguments(args))
-        return _out(service.create_ticket(args, ctx.deps.principal.value, key.value))
+        return _out(service.create_ticket(args, Requester.from_caller(ctx.deps.caller), key.value))
 
     def get_ticket(ticket_id: str) -> str:
         return _out(service.get_ticket({"ticket_id": ticket_id}))
