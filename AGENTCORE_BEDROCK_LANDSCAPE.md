@@ -233,9 +233,11 @@ aws bedrock-agentcore-control create-harness \
   --model '{"bedrockModelConfig":{"modelId":"global.anthropic.claude-sonnet-4-6"}}' \
   --system-prompt '[{"text":"You are the internal IT and expenses helpdesk for Fintech Ltd. ..."}]' \
   --skills '[{"s3":{"uri":"s3://fintech-agent-skills/expense-policy/"}}]' \
+  --memory '{"disabled":{}}' \
   --max-iterations 20 --max-tokens 200000
-
 ```
+
+Through the API, a new harness gets managed memory unless you disable it, as above.
 
 To prompt it, use an SDK (`invoke_harness` in boto3, `InvokeHarnessCommand` in the JavaScript SDK) or `agentcore invoke`. The AWS CLI has **no** `invoke-harness` command: it leaves out operations that stream their answer, and `invoke-agent-runtime-command` and `invoke-code-interpreter` are missing for the same reason.
 
