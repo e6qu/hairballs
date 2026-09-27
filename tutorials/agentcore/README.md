@@ -7,6 +7,8 @@ Every tutorial shows:
 - **application code** side by side, **Python | TypeScript**;
 - **infrastructure** side by side, **agentcore CLI | AWS CLI | Terraform**.
 
+Every step that touches an AWS resource also names the related **Terraform resource** (linked to its provider docs).
+
 The full, checked source for each tutorial is in [`examples/`](examples/).
 
 Start with [the developer introduction](../../AGENTCORE_BEDROCK_LANDSCAPE.md) if you haven't read it: it explains what Runtime, the harness and Strands are.
