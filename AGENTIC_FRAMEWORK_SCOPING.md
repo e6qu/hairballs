@@ -4,6 +4,8 @@
 **Primary platform:** Amazon Bedrock and Bedrock AgentCore.
 **Hard constraints:** few dependencies, trusted dependencies, security-scannable artifacts, low supply-chain risk.
 **Status:** Research and scoping. No code has been written yet. Section 11 lists the proof-of-concept work needed before a final decision.
+**Decisions taken:**
+- **2026-09-27: Platform commitment to AWS.** We accept being tied to AWS, Amazon Bedrock (models) and Bedrock AgentCore (agent platform). Portability to other clouds and model vendors is **not** a requirement. See §2 (R1, R11) and §10 (risk 8).
 **Research date:** 2026-09-26/27. Every version, count and date below is as of that date.
 
 ---
@@ -67,7 +69,7 @@
 
 | # | Requirement | Weight | How we assess it |
 |---|---|---|---|
-| R1 | Works natively with **Amazon Bedrock** (Converse API, cross-region inference, guardrails, prompt caching) and deploys to **AgentCore** | Must | Native provider vs. going through LiteLLM; AgentCore CLI template / sample / docs coverage |
+| R1 | **(Decided: AWS commitment)** Works natively with **Amazon Bedrock** (Converse API, cross-region inference, guardrails, prompt caching) and deploys to **AgentCore** | Must | Native provider vs. going through LiteLLM; AgentCore CLI template / sample / docs coverage |
 | R2 | **Few, trusted dependencies** | Must | Transitive package count and size, measured (§5.1); native binaries; install scripts |
 | R3 | **Supply-chain integrity** | Must | Release provenance (PEP 740 / npm provenance), trusted publishing vs. long-lived tokens, CI hygiene, incident history, release cadence |
 | R4 | **Security-scannable** | Must | SBOM-friendly (pure packages, lockfiles), no opaque bundled binaries, OSV/GHSA coverage |
@@ -77,7 +79,7 @@
 | R8 | Observability and auditability (OpenTelemetry, CloudWatch, CloudTrail) | Should | Built-in OTel; AgentCore Observability / Evaluations support |
 | R9 | Multi-agent composition (agents-as-tools, graphs, A2A) | Should | Primitives available |
 | R10 | Longevity: vendor backing, license, API stability | Should | Owner, license, cadence, deprecations |
-| R11 | Model portability (not locked to one model vendor) | Could | Providers supported |
+| R11 | ~~Model / cloud portability~~ | **Dropped** (decision of 2026-09-27) | Not assessed. Choice among the models Bedrock hosts is enough |
 
 ---
 
@@ -695,6 +697,21 @@ The design principle is therefore **make the safe path the easy path.**
 3. **Add Pydantic AI (`pydantic-ai-slim[bedrock]`) as the single approved alternative**, for teams that need its native budget and cost limits or durable execution. It must be pinned behind the same cooldown and mirror controls.
 4. **Ban LiteLLM, CrewAI and Mastra as dependencies.** Do not use Claude Agent SDK, opencode, pi or Codex as runtime platforms (developer-tool use falls under a separate policy).
 5. **Build the thin internal wrapper `org-agents`.** Its job is to enforce limits, budgets, loop detection, idempotency, the thread-message policy, redaction and telemetry. It adds no new third-party dependencies.
+6. **Consequences of the AWS commitment (2026-09-27):**
+   - **Prefer AWS-native building blocks** over framework-bundled or third-party equivalents:
+     - AgentCore Memory, or S3/DynamoDB with KMS, rather than framework session stores;
+     - AgentCore Gateway + Policy rather than ad-hoc MCP servers;
+     - AgentCore Observability/CloudWatch rather than LangSmith or Logfire;
+     - Bedrock Guardrails;
+     - application inference profiles and AWS Budgets for cost control;
+     - AWS Step Functions for long-running, deterministic orchestration, rather than Temporal or DBOS.
+   - **Model choice = the Bedrock catalog.** Only frameworks with a native Bedrock provider qualify. This confirms excluding the OpenAI Agents SDK and Google ADK, which reach Bedrock only through LiteLLM.
+   - **Pydantic AI's case as the alternative narrows.** Its durable-execution integrations (Temporal, DBOS, Prefect) matter less, so the remaining reason to choose it is native budget and cost limits. Reassess after the PoC. If the `org-agents` wrapper gives Strands equivalent limits, drop the alternative and keep a single standard.
+   - **Engage AWS directly** (account team / Strands maintainers) on:
+     - trimming Strands' mandatory dependencies;
+     - SHA-pinning the GitHub Actions in its repo;
+     - native mid-run message steering;
+     - clarifying the language AgentCore Policy uses for temporal conditions.
 
 ### 9.2 Why Strands over the alternatives
 
@@ -707,7 +724,7 @@ The design principle is therefore **make the safe path the easy path.**
 | R6 Runaway defaults | ● (none by default; wrapper needed) | ●●● | ● (10,007) | ●● (10 turns, no budget) |
 | R5 HITL / sessions | ●●● | ●● | ●●● | ●● |
 | R7 Non-developer path | ●●● (same stack as the AgentCore harness) | ● | ● | ● |
-| R10 Vendor alignment | ●●● (existing AWS relationship) | ●● | ●● | ● |
+| R10 Vendor alignment (AWS commitment) | ●●● (AWS-owned; AgentCore reference framework) | ●● | ●● | ● |
 
 Strands' weak points are runaway defaults, the dependency set, experimental churn and CI hygiene. The wrapper and the supply-chain controls address them, and none of them is decisive. Pydantic AI is technically cleaner on dependencies and limits, but its release cadence, its thinner AgentCore integration and the lack of a no-code path make it the alternative, not the default.
 
@@ -739,14 +756,14 @@ Strands' weak points are runaway defaults, the dependency set, experimental chur
 
 | # | Risk / question | Mitigation / next step |
 |---|---|---|
-| 1 | **Strands has low community mindshare** (11 HN comment mentions) and depends on AWS's continued investment | AWS-internal use ("thousands of agents") and AgentCore alignment reduce the risk. Keep the wrapper's API framework-neutral so Pydantic AI stays a viable fallback |
+| 1 | **Strands has low community mindshare** (11 HN comment mentions) and depends on AWS's continued investment | AWS-internal use ("thousands of agents") and AgentCore alignment reduce the risk; with the AWS commitment, AWS's own stack is the lowest-risk bet. Keep the wrapper's *agent-authoring* API thin so Pydantic AI stays a viable fallback **inside** AgentCore Runtime |
 | 2 | **Strands churn**: weekly releases, `experimental` features, the repo rename, and deprecations (`structured_output()`) | Allow only non-experimental APIs in the wrapper. Quarterly upgrade cadence behind the cooldown. Contract tests in the PoC |
 | 3 | **Strands Python mandatory dependencies** (MCP, OTel SDK, uvicorn, starlette, watchdog) | Measure the actual import surface. Engage AWS about extras. Accept for now: all are mainstream, high-scrutiny packages |
 | 4 | **Weak CI hygiene in the Strands repo** (few SHA-pinned Actions; `pull_request_target`) | Rely on PEP 740 / npm provenance verification plus a cooldown. Raise with AWS through our account team |
 | 5 | **No native steering in Strands** (mid-run messages throw) | Implement a queue and a `BeforeModelCallEvent` injection in the wrapper (PoC). Otherwise use the reject-or-queue policy |
 | 6 | **AgentCore Policy temporal conditions**: the docs mention "Dogwood" alongside Cedar | Verify the language and GA status before relying on it for approvals or budgets |
 | 7 | **Vendor-reported benchmark** (Strands harness uses 28% fewer tokens) is disputed | Run our own token and cost comparison in the PoC |
-| 8 | **Lock-in to AWS AgentCore** | Strands also runs outside AWS (Cloudflare and Modal are reported). A2A and MCP are open standards. Keep tools behind MCP |
+| 8 | ~~Lock-in to AWS AgentCore~~ **Accepted** (decision of 2026-09-27) | We use AgentCore-native services (harness, Gateway, Policy, Identity, Memory, Observability, Evaluations) as first-class parts of the architecture, with no abstraction layers built for portability. Exposing tools as MCP is kept for **reuse across agents and teams**, not for portability. What remains is **dependence on AWS's roadmap**. Mitigate it through the AWS account team, preview/GA tracking and the §11 PoC |
 | 9 | **Compaction vs. record-keeping**: summaries may drop regulatory detail | Persist pre-compaction transcripts. Prefer deterministic truncation for regulated flows |
 | 10 | Items not verified directly: Scorecard scores for most repos (not published); some ClawHub and CHAINDROP figures (secondary sources); LangGraph Server's default `multitask_strategy`; Bedrock caching in langchain-aws; the exact Bedrock cache prices (see the pricing page) | Close these out during the PoC |
 
