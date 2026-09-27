@@ -11,6 +11,11 @@ def test_bundled_corpus_search() -> None:
     assert isinstance(result, ToolSuccess) and "expense-policy" in result.text
 
 
+def test_calculation_is_rendered_in_plain_notation() -> None:
+    result = tools().calculate({"expression": "180*3"})
+    assert isinstance(result, ToolSuccess) and result.text == "180*3 = 540"
+
+
 def test_invalid_args_are_reported_with_path() -> None:
     result = tools().calculate({"expression": "__import__('os')"})
     assert isinstance(result, ToolFailure) and "$.expression" in result.text

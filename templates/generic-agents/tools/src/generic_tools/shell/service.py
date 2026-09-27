@@ -72,7 +72,7 @@ class GenericTools:
             return ToolFailure(f"invalid arguments: {exc}")
         match calculate(expression):
             case Calculated(value=value):
-                return ToolSuccess(f"{expression.text} = {value}")
+                return ToolSuccess(f"{expression.text} = {value:f}")
             case CalculationError(reason=reason):
                 return ToolFailure(f"cannot calculate: {reason}")
 

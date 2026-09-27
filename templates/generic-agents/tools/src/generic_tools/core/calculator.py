@@ -99,4 +99,5 @@ def calculate(expression: Expression) -> CalculationOutcome:
         return CalculationError(str(exc))
     except (DivisionByZero, InvalidOperation):
         return CalculationError("division by zero or invalid operation")
-    return Calculated(value.normalize() if value == value.to_integral() else value)
+    # Integers keep exponent 0 (540, never 5.4E+2); fractions drop trailing zeros (0.30 -> 0.3).
+    return Calculated(value.to_integral_value() if value == value.to_integral_value() else value.normalize())
