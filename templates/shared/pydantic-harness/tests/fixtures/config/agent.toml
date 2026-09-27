@@ -1,0 +1,32 @@
+# Test agent for the harness (category-agnostic toy tools).
+[agent]
+name = "harness_test"
+busy_policy = "steer"
+
+[model]
+id = "global.anthropic.claude-sonnet-4-6"
+region = "eu-west-1"
+price = { input_per_mtok = "3.00", output_per_mtok = "15.00", cache_read_per_mtok = "0.30", cache_write_per_mtok = "3.75" }
+
+[limits]
+max_turns = 12
+max_total_tokens = 200000
+max_usd = "0.50"
+max_wall_seconds = 300
+max_tool_calls = 20
+repeat_threshold = 3
+
+[tools]
+allowed = ["echo", "dump", "send_email"]
+approval_required = ["send_email"]
+
+[approvals]
+self_approval = false
+approvers = ["auth0|lead"]
+
+[context]
+max_tool_output_chars = 2000
+keep_head_chars = 1200
+keep_tail_chars = 600
+max_messages = 60
+keep_messages = 30
