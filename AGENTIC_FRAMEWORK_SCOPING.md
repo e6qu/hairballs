@@ -287,6 +287,70 @@ Versions are taken from PyPI and npm on 2026-09-26/27.
 
 We should carry these into the Tier 1 wrapper and the platform design (§6, §9).
 
+### 4.8 Head-to-head: Strands vs LangGraph vs Pydantic AI vs pi vs opencode vs Hermes
+
+These six span the range from *agent frameworks* (libraries you compose) to *agent harnesses* (complete agents you configure and extend). Hermes Agent ([NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent), reviewed at commit `60e531c`, 2026-09-27) was added at the user's request, and the same method was applied to it.
+
+```mermaid
+quadrantChart
+    title Governance fit vs batteries included (qualitative)
+    x-axis "Primitives" --> "Batteries included"
+    y-axis "Weak regulated fit" --> "Strong regulated fit"
+    quadrant-1 "Managed harness"
+    quadrant-2 "Governed frameworks"
+    quadrant-3 "Raw building blocks"
+    quadrant-4 "Personal / dev harnesses"
+    "Strands SDK": [0.25, 0.80]
+    "Pydantic AI": [0.20, 0.72]
+    "LangGraph": [0.32, 0.60]
+    "Strands harness": [0.62, 0.70]
+    "AgentCore managed harness": [0.80, 0.88]
+    "pi": [0.55, 0.22]
+    "opencode": [0.75, 0.40]
+    "Hermes": [0.90, 0.20]
+```
+
+| | **Strands** | **LangGraph** | **Pydantic AI** | **pi** | **opencode** | **Hermes Agent** |
+|---|---|---|---|---|---|---|
+| **Kind** | Framework, plus an optional harness (`strands-harness`) | Framework (graph / state machine) | Framework (typed loop) | Harness built on reusable libraries (`pi-ai`, `pi-agent-core`) | Harness with a client/server split | Harness: personal "self-improving" agent plus a multi-platform chat gateway |
+| **Owner / license** | AWS / Apache-2.0 | LangChain Inc. / MIT | Pydantic Inc. / MIT | Earendil (Mario Zechner) / MIT | Anomaly (SST) / MIT | Nous Research / MIT |
+| **Language** | Python, TypeScript | Python, TypeScript | Python | TypeScript (Node) | TypeScript (Bun, native binary) | Python (HEAD requires **Python ≥ 3.14**) |
+| **Bedrock** | Native, the **default** (Converse) | Native (`langchain-aws`) | Native (`bedrock` extra) | Native in `pi-ai` (ambient AWS credentials or bearer token) | Native (`amazon-bedrock`, via the AI SDK) | Native boto3: Converse, plus InvokeModel for Claude; Guardrails and inference profiles |
+| **Current AgentCore** | CLI template (Python and TS), Evaluations, harness built on it | CLI template, Evaluations | Samples only | Own code in a container (`--type byo --build Container`) | Own code in a container | Own code in a container |
+| **Dependencies (measured)** | 48 Python / 32 npm (no peers) | 46 Python | **24** Python | 117 npm (`pi-ai` + `pi-agent-core`), with install scripts | 13 npm + a **354 MB binary installed by postinstall** | 60 Python (0.19.0; 64 with `[bedrock]`) |
+| **Release provenance** | PEP 740 + npm provenance | npm only | PEP 740 | npm provenance | no attestation | PEP 740 on PyPI, but **PyPI is stale and unsupported**; current releases ship as GitHub bundles, Docker, APT and Nix |
+| **Release cadence (90 days)** | 15 | 6 | 65 | 23 | 1,472 including canaries (42 stable) | 18 stable tags plus daily canaries |
+| **Security advisories** | none in OSV | LangGrinch (CVE-2025-68664), checkpoint deserialization | SSRF CVEs | none found | CVE-2026-22812 / -22813 | **10** (injection, DNS rebinding, world-readable DBs, sandbox) |
+| **Default turn limit** | none (opt-in `limits.turns`) | 10,007 | 50 requests | none | `agent.steps` (configurable) | none (`max_turns=None`) |
+| **Token / cost budget** | opt-in soft token limits | call-count middleware only | tokens + **USD** | none (write an extension) | none | wall-clock only (opt-in); no token or USD budget |
+| **Loop detection** | Swarm only | none | none | none | **doom loop**: 3 identical calls → ask | tool-loop guardrails (hard stop by default only for unattended runs), repetition guard |
+| **Message arrives mid-run** | throws `ConcurrencyException` | none in OSS (Server: `multitask_strategy`) | `enqueue(asap / when_idle)` | `steer()` / `followUp()` | joins the run at the next step | `interrupt` (default) / `queue` / `steer` / `redirect` |
+| **Sessions** | file / S3 / repository / snapshot | checkpointers (SQLite, Postgres) | bring your own | JSONL tree (branching) | SQLite | SQLite + FTS5 search |
+| **Compaction** | sliding window; "auto" in the harness | middleware | history processors | automatic summary | summary + tool-output pruning | automatic at 50% of the window |
+| **Prompt caching** | `CacheConfig` (on by default in the harness) | Anthropic middleware | opt-in | automatic plus a cache warmer | automatic, but the date sits in the system prompt, so the cache resets daily | automatic (frozen memory snapshot; Bedrock `cachePoint` on an allowlist of models) |
+| **Sub-agents** | agents-as-tools, Swarm, Graph, A2A | subgraphs, handoffs | delegation through tools | example extension only | `task` tool (no nesting) | `delegate_task`: depth 1, 10 concurrent, 250 iterations; **budget not shared with the parent** |
+| **Permissions / sandbox** | interrupts, Cedar interventions; AgentCore microVM | HITL middleware | `requires_approval` | **none** by design (use a container) | allow / ask / deny rules; headless `run` **auto-rejects** anything that would ask; no OS sandbox | default is `smart`, where **an LLM auto-approves** low-risk commands; regex-based gating; docker, modal and similar backends |
+| **Self-modification** | – | – | – | extensions can be installed at runtime | plugins are auto-installed from npm | **writes its own skills and memory without approval by default** |
+| **Headless / embedding** | library | library | library | print / JSON / RPC modes; TypeScript SDK | `run`, `serve` (OpenAPI), JS SDK, GitHub Actions | `-q`, OpenAI-compatible API server, ACP, MCP server, cron, chat gateway; library only from a git checkout |
+| **HN comment mentions** | 11 | 649 | 114 | 330+ | 4,780 | 169 |
+| **Verdict for us** | **Tier 1 standard** | not recommended | approved alternative | design reference; sandboxed internal coding agent at most | design reference; sandboxed internal coding agent at most | **design reference only** |
+
+**What Hermes adds to the picture:**
+- **Good Bedrock engineering.** Native boto3 support, Guardrails, application inference profiles, and `cachePoint` limited to the models that support it.
+- **The richest mid-run message handling of any system reviewed.** `interrupt`, `queue`, `steer` and `redirect`, and the gateway turns an interrupt into a queue while sub-agents are running.
+- **Carefully designed cache-stable prompts.**
+
+**Why it is ruled out for staff-built agents:**
+- Its defaults are the opposite of what a fintech needs: unlimited turns, no cost budget, an LLM auto-approving commands, and self-written skills and memory without review.
+- The published PyPI package is stale and officially unsupported, and HEAD requires Python ≥ 3.14.
+- Churn is very high: hundreds of commits a day.
+- 10 security advisories so far.
+- Governance is disputed: the plagiarism claims in [#10232](https://github.com/NousResearch/hermes-agent/issues/10232) (edited) and [#17688](https://github.com/NousResearch/hermes-agent/issues/17688).
+
+**pi and opencode:**
+- They are the best *engineered harnesses* to learn from. Can they run unattended? See [`AGENTS_BUILDING_BLOCKS.md`](AGENTS_BUILDING_BLOCKS.md).
+- How to run them on Bedrock and AgentCore under our controls is covered in [`AGENT_PI_BEDROCK.md`](AGENT_PI_BEDROCK.md) and [`AGENTS_OPENCODE_BEDROCK.md`](AGENTS_OPENCODE_BEDROCK.md).
+
 ---
 
 ## 5. Supply-chain and dependency analysis
