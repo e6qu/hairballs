@@ -219,6 +219,46 @@
         "idleRuntimeSessionTimeout": 900,
         "maxLifetime": 3600
       }
+    },
+    {
+      "name": "generic_pi_harness",
+      "build": "Container",
+      "entrypoint": "src/shell/app.ts",
+      "codeLocation": "generic-agents/pi-harness/",
+      "buildContextPath": ".",
+      "dockerfile": "generic-agents/pi-harness/Dockerfile",
+      "runtimeVersion": "NODE_22",
+      "networkMode": "PUBLIC",
+      "protocol": "HTTP",
+      "envVars": [
+        {
+          "name": "AWS_REGION",
+          "value": "eu-west-1"
+        },
+        {
+          "name": "AGENT_MAX_USD",
+          "value": "0.50"
+        },
+        {
+          "name": "AGENT_MAX_TURNS",
+          "value": "12"
+        },
+        {
+          "name": "TOOLS_MCP_URL",
+          "value": "https://REPLACE-gateway-id.gateway.bedrock-agentcore.eu-west-1.amazonaws.com/mcp"
+        },
+        {
+          "name": "AGENTCORE_RUNTIME",
+          "value": "1"
+        }
+      ],
+      "requestHeaderAllowlist": [
+        "Authorization"
+      ],
+      "lifecycleConfiguration": {
+        "idleRuntimeSessionTimeout": 900,
+        "maxLifetime": 3600
+      }
     }
   ],
   "memories": [],
