@@ -1,0 +1,19 @@
+[project]
+name = "helpdesk-memory"
+version = "0.1.0"
+description = "The helpdesk agent with its thread in AgentCore Memory, plus prompt caching"
+requires-python = ">=3.12"
+dependencies = [
+    "bedrock-agentcore==1.23.1",
+    "boto3==1.43.103",
+    "strands-agents==1.57.1",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[bedrock-agentcore,bedrock-runtime]==1.43.103",
+    "mypy==2.3.1",
+]
+
+[tool.ruff]
+line-length = 100

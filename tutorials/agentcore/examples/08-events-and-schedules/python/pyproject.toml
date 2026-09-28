@@ -1,0 +1,19 @@
+[project]
+name = "helpdesk-events"
+version = "0.1.0"
+description = "Run the helpdesk agent from EventBridge events and schedules"
+requires-python = ">=3.12"
+dependencies = [
+    "bedrock-agentcore==1.23.1",
+    "boto3==1.43.103",
+    "strands-agents==1.57.1",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[secretsmanager]==1.43.103",
+    "mypy==2.3.1",
+]
+
+[tool.ruff]
+line-length = 100

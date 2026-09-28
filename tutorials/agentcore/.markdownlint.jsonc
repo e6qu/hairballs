@@ -1,0 +1,8 @@
+{
+  // Tutorials use HTML tables for side-by-side code and long lines in prose.
+  "default": true,
+  "MD013": false,
+  "MD033": false,
+  "MD024": { "siblings_only": true },
+  "MD041": false
+}

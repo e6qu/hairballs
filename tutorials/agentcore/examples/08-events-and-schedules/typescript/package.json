@@ -1,0 +1,19 @@
+{
+  "name": "helpdesk-events",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "agent": "tsx agent.ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "3.1141.0",
+    "@strands-agents/sdk": "1.19.0",
+    "bedrock-agentcore": "0.4.4"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.4",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

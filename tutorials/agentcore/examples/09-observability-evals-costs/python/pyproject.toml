@@ -1,0 +1,18 @@
+[project]
+name = "helpdesk-observability"
+version = "0.1.0"
+description = "Token usage, evaluations and cost per agent for the helpdesk harness"
+requires-python = ">=3.12"
+dependencies = [
+    "bedrock-agentcore==1.23.1",
+    "boto3==1.43.103",
+]
+
+[dependency-groups]
+dev = [
+    "boto3-stubs[bedrock-agentcore,bedrock-agentcore-control]==1.43.103",
+    "mypy==2.3.1",
+]
+
+[tool.ruff]
+line-length = 100

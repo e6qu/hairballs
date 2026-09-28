@@ -1,0 +1,15 @@
+[
+  {
+    "name": "check_claim",
+    "description": "Check whether an expense amount is within Fintech Ltd policy. Returns within_policy, limit_eur and, when over the limit, excess_eur.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "category": { "type": "string", "description": "hotel (per night) or meals (per day)" },
+        "amount_eur": { "type": "number", "description": "The amount claimed, in EUR" },
+        "city_class": { "type": "string", "description": "major or standard (default standard)" }
+      },
+      "required": ["category", "amount_eur"]
+    }
+  }
+]

@@ -9,5 +9,7 @@ Research on standardizing agent frameworks for a fintech. The fintech is committ
 | [`AGENT_IDENTITY_AUTH0.md`](AGENT_IDENTITY_AUTH0.md) | Auth0 with AgentCore Identity: inbound JWT, workload identity, Token Vault, OBO, Cedar policies on Auth0 claims, CIBA approvals |
 | [`AGENT_PI_BEDROCK.md`](AGENT_PI_BEDROCK.md) | Running pi and pi extensions autonomously on Bedrock and AgentCore Runtime |
 | [`AGENTS_OPENCODE_BEDROCK.md`](AGENTS_OPENCODE_BEDROCK.md) | Running opencode agents and plugins autonomously on Bedrock and AgentCore Runtime |
+| [`AGENTCORE_BEDROCK_LANDSCAPE.md`](AGENTCORE_BEDROCK_LANDSCAPE.md) | Developer introduction to AgentCore and Bedrock: build an agent with the CLI step by step (skills, tools, prompting), where Strands and your own code fit, what you pay for, a self-service platform design with Auth0, and how Google, Azure, Anthropic and OpenAI compare |
+| [`templates/`](templates/README.md) | Runnable agent templates (8 framework/harness variants), shared org libraries, on-demand evals and the autoresearch loop |
 
 All diagrams are Mermaid embedded in Markdown and target the **current** AgentCore (the `@aws/agentcore` CLI), not the legacy Starter Toolkit or Bedrock Agents Classic. Facts were verified on 2026-09-26/27. Anything unverified is marked "verify in PoC".

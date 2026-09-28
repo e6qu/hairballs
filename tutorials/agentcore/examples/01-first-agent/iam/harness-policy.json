@@ -1,0 +1,55 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "InvokeModels",
+      "Effect": "Allow",
+      "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+      "Resource": [
+        "arn:aws:bedrock:*::foundation-model/*",
+        "arn:aws:bedrock:eu-west-1:111122223333:*"
+      ]
+    },
+    {
+      "Sid": "PullHarnessImage",
+      "Effect": "Allow",
+      "Action": ["ecr-public:GetAuthorizationToken", "sts:GetServiceBearerToken"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "WriteLogs",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:DescribeLogStreams",
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:eu-west-1:111122223333:log-group:/aws/bedrock-agentcore/runtimes/*"
+    },
+    {
+      "Sid": "WriteTracesAndMetrics",
+      "Effect": "Allow",
+      "Action": [
+        "xray:PutTraceSegments",
+        "xray:PutTelemetryRecords",
+        "xray:GetSamplingRules",
+        "xray:GetSamplingTargets",
+        "cloudwatch:PutMetricData"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "WorkloadIdentity",
+      "Effect": "Allow",
+      "Action": [
+        "bedrock-agentcore:GetWorkloadAccessToken",
+        "bedrock-agentcore:GetWorkloadAccessTokenForJWT"
+      ],
+      "Resource": [
+        "arn:aws:bedrock-agentcore:eu-west-1:111122223333:workload-identity-directory/default",
+        "arn:aws:bedrock-agentcore:eu-west-1:111122223333:workload-identity-directory/default/workload-identity/harness_helpdesk-*"
+      ]
+    }
+  ]
+}
